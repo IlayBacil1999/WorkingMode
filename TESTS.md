@@ -32,6 +32,8 @@ A good run has an `alive` line every minute, no `GAP`, and `online=yes`.
 | **T8** | Crash recovery | While ON: Task Manager › end `working-mode.exe`, then start it again | "Working Mode resumed" and the session continues. Exit normally → the icon goes grey and `--selftest` shows the original plan values | `state.json` recovery |
 | **T9** | Reboot recovery | While ON (timer still running), restart Windows | The app autostarts and resumes. If the timer expired during the reboot, it restores instead | autostart |
 | **T11** | Real CPU temperature | Install LibreHardwareMonitor, Options › Remote Web Server › Run (port 8085), Options › Run on Windows startup. Then `working-mode.exe --status` | `CPU temperature` shows a number close to LHM's "CPU Package"; `alive` lines show `cputemp=` | `hot_cpu_temp_c` (85), `hot_cpu_max` (60) |
+| **T12** | Watchdog | While ON: Task Manager › end `working-mode.exe`, then wait up to 5 min (or `schtasks /run /tn WorkingModeWatchdog`) | Log shows `watchdog: … starting it` then `session resumed`; after a clean stop, `schtasks /query /tn WorkingModeWatchdog` finds nothing | that a crash in the bag is recovered |
+| **T13** | Plan switched by something else | While ON: `powercfg /setactive SCHEME_BALANCED` | Within 5 s the log shows `power plan was switched … switching back` and the Working Mode plan is active again | plan drift |
 | **T10** | Long run with Claude Code | Start 2–4 h, give Claude Code a long task, close the lid | The task finishes; the log is clean | the real goal |
 
 ## Reading results back

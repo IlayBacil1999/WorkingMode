@@ -6,6 +6,7 @@
 //!   working-mode.exe --status     one-screen status of the running session
 //!   working-mode.exe --extend [N] add N minutes (default 60) to the running session
 //!   working-mode.exe --stop       stop the running session
+//!   working-mode.exe --watchdog   run by a scheduled task: restart the app if a session lost it
 //!   working-mode.exe --restore    emergency: put normal power settings back
 //!   working-mode.exe --uninstall  restore, delete the plan, autostart and data
 
@@ -16,6 +17,7 @@ mod config;
 mod engine;
 mod power;
 mod sensors;
+mod watchdog;
 mod win;
 mod wifi;
 
@@ -48,6 +50,7 @@ fn main() {
             }
         },
         "--stop" => remote(app::REMOTE_STOP, 0),
+        "--watchdog" => watchdog::run(app_running()),
         _ => {
             println!("usage: working-mode.exe [--status | --extend [minutes] | --stop | --selftest | --restore | --uninstall]");
             2
@@ -260,6 +263,7 @@ fn uninstall() -> i32 {
         }
     }
     config::set_autostart(false);
+    watchdog::remove();
     let _ = std::fs::remove_dir_all(config::data_dir());
     println!("Removed autostart and settings.");
     rc

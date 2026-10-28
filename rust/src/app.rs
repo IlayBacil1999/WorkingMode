@@ -88,6 +88,7 @@ struct App {
     ssid: Option<String>,
     /// Whether the last reading had a CPU temperature, to log when it comes and goes.
     cpu_temp_ok: Option<bool>,
+    plan_drift_notified: bool,
 }
 
 struct Icons {
@@ -308,11 +309,15 @@ impl App {
             self.notify("Couldn't start Working Mode", &e, true);
             return;
         }
+        if !crate::watchdog::install() {
+            log("couldn't create the watchdog task - if the app dies, nothing restarts it");
+        }
         self.request = if self.cfg.hold_power_request { PowerRequest::new() } else { None };
         self.wifi = wifi::current();
         self.ssid = self.wifi.as_ref().map(|w| w.ssid.clone());
         self.engine.start(now(), secs);
         self.last_net_check = 0;
+        self.plan_drift_notified = false;
         self.cpu_temp_ok = Some(self.inputs().readings.cpu_temp_c.is_some());
         let no_cpu_temp = self.cfg.lhm_port > 0 && self.cpu_temp_ok == Some(false);
         if no_cpu_temp {
@@ -370,6 +375,7 @@ impl App {
             return;
         }
         self.save_state();
+        crate::watchdog::remove();
         log(&format!("session ended ({reason:?}) - restored plan {}", guid_to_string(&prev)));
         let body = match reason {
             EndReason::Timer => "Time's up. Normal power settings are back.",
@@ -431,6 +437,7 @@ impl App {
                 });
                 self.cpu_temp_ok = Some(ok);
             }
+            self.keep_plan_active();
             let ssid = wifi::current().map(|c| c.ssid);
             if ssid != self.ssid {
                 let name = |s: &Option<String>| s.as_deref().map_or("none".into(), |s| format!("'{s}'"));
@@ -450,6 +457,27 @@ impl App {
                 let ok = wifi::internet_ok();
                 unsafe { PostMessageW(hwnd as HWND, WM_NET, ok as usize, 0) };
             });
+        }
+    }
+
+    /// Something else (Control Panel, another tool) switched the power plan
+    /// during a session: with the normal plan back, closing the lid sleeps
+    /// the PC. Switch back and say so once.
+    fn keep_plan_active(&mut self) {
+        if self.engine.countdown.is_some() {
+            return;
+        }
+        let (Some(plan), Ok(active)) = (self.plan, power::active_scheme()) else { return };
+        if guid_eq(&plan, &active) {
+            return;
+        }
+        log(&format!("power plan was switched to {} by something else - switching back", guid_to_string(&active)));
+        if let Err(e) = self.apply() {
+            log(&format!("couldn't switch back: {e}"));
+        }
+        if !self.plan_drift_notified {
+            self.plan_drift_notified = true;
+            self.notify("Power plan was changed", "Something switched the power plan. Working Mode switched it back.", true);
         }
     }
 
@@ -833,6 +861,7 @@ pub fn run() {
             sensors: Sensors::new(),
             ssid: None,
             cpu_temp_ok: None,
+            plan_drift_notified: false,
         };
         APP.with(|a| *a.borrow_mut() = Some(app));
         with_app(|a| a.add_tray_icon());
