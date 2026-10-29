@@ -31,8 +31,12 @@ pub struct Params {
     pub reconnect_after_secs: u64,
     /// Lower the CPU limit at this CPU temperature (LibreHardwareMonitor); 0 = off.
     pub hot_cpu_temp_c: i32,
-    /// Same, on the board sensor, used when there is no CPU temperature; 0 = off.
+    /// Same, on the board sensor, used when there is no CPU temperature and
+    /// the sensor has been seen to move; 0 = off.
     pub hot_temp_c: i32,
+    /// With no usable temperature at all: lower the CPU limit when the CPU has
+    /// averaged this busy (percent) with the lid closed; 0 = off.
+    pub hot_load_pct: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -51,6 +55,8 @@ pub struct Readings {
     /// ACPI board sensor; on some laptops it hardly moves.
     pub temp_c: Option<i32>,
     pub cpu_load: Option<u32>,
+    /// Percent of time the CPU was busy, whatever its speed.
+    pub cpu_busy: Option<u32>,
     /// Percent of the CPU's nominal speed; drops when it throttles.
     pub cpu_freq: Option<u32>,
 }
@@ -103,6 +109,24 @@ const HOT_FOR_SECS: u64 = 30;
 const COOL_FOR_SECS: u64 = 300;
 const CPU_HYSTERESIS_C: i32 = 10;
 const BOARD_HYSTERESIS_C: i32 = 5;
+/// The load guard lifts once the average is this many points below its limit.
+const LOAD_HYSTERESIS_PCT: i32 = 35;
+/// Some ACPI zones report a fixed value (28C on this Zenbook): the board
+/// sensor counts only once it has moved this much.
+const BOARD_MOVES_C: i32 = 2;
+/// Time constant of the CPU busy average: ~4 min of full load reach 80%.
+const BUSY_AVG_SECS: f64 = 150.0;
+
+/// What the heat guard goes by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeatSource {
+    /// Real CPU temperature (LibreHardwareMonitor).
+    Cpu,
+    /// ACPI board sensor, once it has been seen to move.
+    Board,
+    /// No usable temperature: sustained CPU load with the lid closed.
+    Load,
+}
 
 pub struct Engine {
     pub params: Params,
@@ -110,10 +134,15 @@ pub struct Engine {
     pub countdown: Option<Countdown>,
     pub online: Option<bool>,
     pub cooling: bool,
-    /// Which sensor started the cooling: CPU (true) or board.
-    cooling_on_cpu: bool,
+    /// What started the cooling; only that may lift it.
+    cooling_by: HeatSource,
     hot_since: Option<u64>,
     cooling_since: u64,
+    /// Lowest and highest board reading this session.
+    board_range: Option<(i32, i32)>,
+    /// Moving average of `cpu_busy`, and when it was last fed.
+    busy_avg: f64,
+    busy_at: Option<u64>,
     battery_alerted: bool,
     offline_since: Option<u64>,
     last_reconnect: Option<u64>,
@@ -145,9 +174,12 @@ impl Engine {
             countdown: None,
             online: None,
             cooling: false,
-            cooling_on_cpu: false,
+            cooling_by: HeatSource::Cpu,
             hot_since: None,
             cooling_since: 0,
+            board_range: None,
+            busy_avg: 0.0,
+            busy_at: None,
             battery_alerted: false,
             offline_since: None,
             last_reconnect: None,
@@ -171,6 +203,9 @@ impl Engine {
         self.countdown = None;
         self.cooling = false;
         self.hot_since = None;
+        self.board_range = None;
+        self.busy_avg = 0.0;
+        self.busy_at = None;
         self.battery_alerted = false;
         self.offline_since = None;
         self.last_reconnect = None;
@@ -307,11 +342,13 @@ impl Engine {
             let r = inp.readings;
             let opt = |v: Option<u32>| v.map_or("?".into(), |v| v.to_string());
             acts.push(Action::Log(format!(
-                "alive  online={online}  battery={bat}  lid={lid}  idle={}s  cputemp={}C  board={}C  cpu={}%  speed={}%{}",
+                "alive  online={online}  battery={bat}  lid={lid}  idle={}s  cputemp={}C  board={}C  cpu={}%  busy={}% (avg {:.0}%)  speed={}%{}",
                 inp.idle_secs,
                 r.cpu_temp_c.map_or("?".into(), |t| t.to_string()),
                 r.temp_c.map_or("?".into(), |t| t.to_string()),
                 opt(r.cpu_load),
+                opt(r.cpu_busy),
+                self.busy_avg,
                 opt(r.cpu_freq),
                 if self.cooling { "  COOLING" } else { "" },
             )));
@@ -345,27 +382,82 @@ impl Engine {
         acts
     }
 
-    fn heat_guard(&mut self, inp: &Inputs) -> Vec<Action> {
+    /// Feeds the board range and the busy average; called every tick.
+    fn track(&mut self, inp: &Inputs) {
         let r = inp.readings;
-        let cpu = (r.cpu_temp_c, self.params.hot_cpu_temp_c, CPU_HYSTERESIS_C, "CPU");
-        let board = (r.temp_c, self.params.hot_temp_c, BOARD_HYSTERESIS_C, "Sensor");
+        if let Some(t) = r.temp_c {
+            let (lo, hi) = self.board_range.get_or_insert((t, t));
+            (*lo, *hi) = ((*lo).min(t), (*hi).max(t));
+        }
+        if let Some(b) = r.cpu_busy {
+            // a long gap (sleep) counts as one minute, not as hours at this reading
+            let dt = self.busy_at.map_or(0, |t| inp.now.saturating_sub(t)).min(60) as f64;
+            self.busy_avg += (b.min(100) as f64 - self.busy_avg) * (dt / BUSY_AVG_SECS).min(1.0);
+            self.busy_at = Some(inp.now);
+        }
+    }
 
+    pub fn busy_avg(&self) -> f64 {
+        self.busy_avg
+    }
+
+    fn board_moves(&self) -> bool {
+        self.board_range.is_some_and(|(lo, hi)| hi - lo >= BOARD_MOVES_C)
+    }
+
+    /// What the heat guard goes by with these readings.
+    pub fn heat_source(&self, r: &Readings) -> HeatSource {
+        if r.cpu_temp_c.is_some() {
+            HeatSource::Cpu
+        } else if r.temp_c.is_some() && self.board_moves() {
+            HeatSource::Board
+        } else {
+            HeatSource::Load
+        }
+    }
+
+    /// Current value, limit, hysteresis, and how to say it, for one source.
+    fn heat_signal(&self, by: HeatSource, inp: &Inputs) -> (Option<i32>, i32, i32, fn(i32) -> String) {
+        let r = inp.readings;
+        match by {
+            HeatSource::Cpu => (r.cpu_temp_c, self.params.hot_cpu_temp_c, CPU_HYSTERESIS_C, |t| format!("CPU at {t}C")),
+            HeatSource::Board => (
+                r.temp_c.filter(|_| self.board_moves()),
+                self.params.hot_temp_c,
+                BOARD_HYSTERESIS_C,
+                |t| format!("Sensor at {t}C"),
+            ),
+            HeatSource::Load => (
+                r.cpu_busy.map(|_| self.busy_avg.round() as i32),
+                self.params.hot_load_pct as i32,
+                LOAD_HYSTERESIS_PCT,
+                |p| format!("CPU busy {p}% for minutes with the lid closed"),
+            ),
+        }
+    }
+
+    fn heat_guard(&mut self, inp: &Inputs) -> Vec<Action> {
+        self.track(inp);
         if self.cooling {
-            // only the sensor that started it may lift it: the board sensor reads far
-            // lower than the CPU, and a missing sensor is no proof of cooling down
-            let (t, hot, hysteresis, what) = if self.cooling_on_cpu { cpu } else { board };
+            // only the source that started it may lift it: the board reads far lower
+            // than the CPU, and a missing sensor is no proof of cooling down
+            let (t, hot, hysteresis, say) = self.heat_signal(self.cooling_by, inp);
             if hot <= 0 {
                 return self.lift("heat guard turned off".into());
             }
+            // the load guard is for a closed lid; with the lid open the fan can breathe
+            if self.cooling_by == HeatSource::Load && inp.lid_closed == Some(false) {
+                return self.lift("lid opened".into());
+            }
             match t {
-                Some(t) if t <= hot - hysteresis && inp.now - self.cooling_since >= COOL_FOR_SECS => {
-                    self.lift(format!("{what} at {t}C"))
-                }
+                Some(t) if t <= hot - hysteresis && inp.now - self.cooling_since >= COOL_FOR_SECS => self.lift(say(t)),
                 _ => vec![],
             }
         } else {
-            let (t, hot, _, what) = if r.cpu_temp_c.is_some() { cpu } else { board };
-            let Some(t) = t.filter(|&t| hot > 0 && t >= hot) else {
+            let by = self.heat_source(&inp.readings);
+            let (t, hot, _, say) = self.heat_signal(by, inp);
+            let lid_ok = by != HeatSource::Load || self.away(inp);
+            let Some(t) = t.filter(|&t| hot > 0 && t >= hot && lid_ok) else {
                 self.hot_since = None;
                 return vec![];
             };
@@ -374,12 +466,12 @@ impl Engine {
                 return vec![];
             }
             self.cooling = true;
-            self.cooling_on_cpu = what == "CPU";
+            self.cooling_by = by;
             self.cooling_since = inp.now;
             vec![
-                Action::Log(format!("hot: {what} at {t}C - lowering the CPU limit")),
+                Action::Log(format!("hot: {} - lowering the CPU limit", say(t))),
                 Action::Cool(true),
-                warn("Running hot", format!("{what} at {t}C. Slowing the CPU down to cool off.")),
+                warn("Running hot", format!("{}. Slowing the CPU down to cool off.", say(t))),
             ]
         }
     }
@@ -439,6 +531,7 @@ mod tests {
             reconnect_after_secs: 90,
             hot_cpu_temp_c: 85,
             hot_temp_c: 60,
+            hot_load_pct: 80,
         }
     }
 
@@ -628,13 +721,75 @@ mod tests {
     fn heat_guard_uses_board_sensor_without_cpu_temp() {
         let mut e = Engine::new(params());
         e.start(0, None);
-        let board = |now| {
+        let board = |now, t| {
             let mut i = inp(now, Some(true));
-            i.readings.temp_c = Some(61);
+            i.readings.temp_c = Some(t);
             i
         };
-        e.tick(&board(5));
-        assert!(cools(&e.tick(&board(40)), true));
+        e.tick(&board(5, 55));
+        e.tick(&board(10, 61));
+        assert!(cools(&e.tick(&board(45, 61)), true));
+    }
+
+    #[test]
+    fn heat_guard_ignores_a_board_sensor_that_never_moves() {
+        let mut e = Engine::new(params());
+        e.start(0, None);
+        for now in (5..600).step_by(5) {
+            let mut i = inp(now, Some(true));
+            i.readings.temp_c = Some(61);
+            assert!(!cools(&e.tick(&i), true));
+        }
+    }
+
+    fn busy_at(now: u64, busy: u32, lid_closed: bool) -> Inputs {
+        let mut i = inp(now, Some(lid_closed));
+        i.readings.temp_c = Some(28);
+        i.readings.cpu_busy = Some(busy);
+        i
+    }
+
+    /// Ticks every 5 s from `from` to `to`; true if cooling was switched as `on`.
+    fn run_busy(e: &mut Engine, from: u64, to: u64, busy: u32, lid_closed: bool, on: bool) -> bool {
+        (from..=to).step_by(5).any(|t| cools(&e.tick(&busy_at(t, busy, lid_closed)), on))
+    }
+
+    #[test]
+    fn load_guard_cools_after_minutes_of_full_load_with_the_lid_closed() {
+        let mut e = Engine::new(params());
+        e.start(0, None);
+        // a two-minute burst is not enough
+        assert!(!run_busy(&mut e, 5, 120, 100, true, true));
+        assert!(!run_busy(&mut e, 125, 300, 10, true, true));
+        // sustained: cools within ~5 min
+        assert!(run_busy(&mut e, 305, 600, 100, true, true));
+        assert_eq!(e.cooling_by, HeatSource::Load);
+        // still busy: stays cool
+        assert!(!run_busy(&mut e, 605, 1200, 100, true, false));
+        // the job ends: lifts once the average is low and 5 min have passed
+        assert!(run_busy(&mut e, 1205, 1800, 5, true, false));
+    }
+
+    #[test]
+    fn load_guard_leaves_an_open_lid_alone() {
+        let mut e = Engine::new(params());
+        e.start(0, None);
+        assert!(!run_busy(&mut e, 5, 900, 100, false, true));
+        // closing the lid under that load cools soon
+        assert!(run_busy(&mut e, 905, 960, 100, true, true));
+        // opening it lifts
+        assert!(cools(&e.tick(&busy_at(965, 100, false)), false));
+    }
+
+    #[test]
+    fn real_cpu_temperature_wins_over_load() {
+        let mut e = Engine::new(params());
+        e.start(0, None);
+        for t in (5..900).step_by(5) {
+            let mut i = busy_at(t, 100, true);
+            i.readings.cpu_temp_c = Some(70);
+            assert!(!cools(&e.tick(&i), true));
+        }
     }
 
     #[test]

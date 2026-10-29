@@ -44,9 +44,12 @@ pub struct Config {
     pub reconnect_after_secs: u64,
     /// Heat guard: after 30 s at this CPU temperature the CPU limit drops to
     /// `hot_cpu_max` for at least 5 min, until it's 10 degrees cooler. 0 = off.
-    /// Needs LibreHardwareMonitor; without it `hot_temp_c` on the board sensor is used.
+    /// Needs LibreHardwareMonitor; without it `hot_temp_c` on the board sensor
+    /// is used if that sensor moves, else `hot_load_pct`: the CPU's busy
+    /// average with the lid closed.
     pub hot_cpu_temp_c: i32,
     pub hot_temp_c: i32,
+    pub hot_load_pct: u32,
     pub hot_cpu_max: u32,
     /// LibreHardwareMonitor's web server port; 0 = don't look for it.
     pub lhm_port: u16,
@@ -77,6 +80,7 @@ impl Default for Config {
             reconnect_after_secs: 90,
             hot_cpu_temp_c: 85,
             hot_temp_c: 60,
+            hot_load_pct: 80,
             hot_cpu_max: 60,
             lhm_port: 8085,
             lhm_user: String::new(),
@@ -123,6 +127,7 @@ impl Config {
             reconnect_after_secs: self.reconnect_after_secs,
             hot_cpu_temp_c: self.hot_cpu_temp_c,
             hot_temp_c: self.hot_temp_c,
+            hot_load_pct: self.hot_load_pct,
         }
     }
 }

@@ -189,7 +189,7 @@ fn status() -> i32 {
     if let Some(s) = sensors {
         // the rate counters need a second sample after a moment
         std::thread::sleep(std::time::Duration::from_secs(1));
-        let r = s.read(&cfg.lhm());
+        let r = s.read_now(&cfg.lhm());
         let opt = |v: Option<u32>| v.map_or("?".into(), |v| format!("{v}%"));
         println!(
             "CPU temperature      {}",
@@ -199,10 +199,22 @@ fn status() -> i32 {
             }
         );
         println!(
-            "board / load / speed {} / {} / {}",
+            "board / busy / speed {} / {} / {}",
             r.temp_c.map_or("?".into(), |t| format!("{t}C")),
-            opt(r.cpu_load),
+            opt(r.cpu_busy),
             opt(r.cpu_freq)
+        );
+        println!(
+            "heat guard           {}",
+            match (r.cpu_temp_c, cfg.hot_cpu_temp_c, cfg.hot_load_pct) {
+                (Some(_), t, _) if t > 0 => format!("by CPU temperature: CPU held at {}% above {t}C", cfg.hot_cpu_max),
+                (None, _, l) if l > 0 => format!(
+                    "by CPU load: CPU held at {}% after a few minutes above {l}% busy with the lid closed \
+                     (the board sensor counts only if it moves)",
+                    cfg.hot_cpu_max
+                ),
+                _ => "off".into(),
+            }
         );
     }
     if let Ok(log) = std::fs::read_to_string(config::log_path()) {

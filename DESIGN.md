@@ -82,6 +82,7 @@ After applying, the app **reads every critical value back**. If any failed, the 
 | `countdown_secs` | 60 | UX |
 | `away_idle_secs` | 300 | only if the lid event never arrives (T2) |
 | `battery_floor` | 15 | |
+| `hot_load_pct` | 80 | T14: heat guard by CPU load, used when there's no CPU temperature and the board sensor never moves (on this Zenbook it's fixed at 28C) |
 
 ## 7. Code layout (`rust/`)
 

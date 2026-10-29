@@ -10,29 +10,44 @@
 use crate::engine::Readings;
 use crate::win::wide;
 use serde_json::Value;
-use std::cell::{Cell, RefCell};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Performance::*;
 
 const TEMP: &str = r"\Thermal Zone Information(*)\Temperature";
 const LOAD: &str = r"\Processor Information(_Total)\% Processor Utility";
+const BUSY: &str = r"\Processor Information(_Total)\% Processor Time";
 const FREQ: &str = r"\Processor Information(_Total)\% of Maximum Frequency";
 
 pub struct Sensors {
     query: isize,
     temp: Option<isize>,
     load: Option<isize>,
+    busy: Option<isize>,
     freq: Option<isize>,
-    /// LibreHardwareMonitor's id for the CPU temperature, once found.
-    lhm_id: RefCell<Option<String>>,
-    /// After a failed try, LHM is left alone until then: a connect to a closed
-    /// localhost port takes ~2 s on Windows, and reads run on the UI thread.
-    lhm_retry_at: Cell<Option<Instant>>,
+    lhm: Arc<LhmReader>,
+}
+
+/// LibreHardwareMonitor is read on a worker thread: a connect to a closed
+/// localhost port takes ~2 s on Windows, too long to freeze the tray for.
+#[derive(Default)]
+struct LhmReader {
+    /// LHM's id for the CPU temperature, once found.
+    id: Mutex<Option<String>>,
+    /// The last good reading and when it was taken.
+    latest: Mutex<Option<(i32, Instant)>>,
+    /// After a failed try, LHM is left alone until then.
+    retry_at: Mutex<Option<Instant>>,
+    /// A read is running on the worker thread.
+    running: AtomicBool,
 }
 
 const LHM_RETRY: Duration = Duration::from_secs(60);
+/// A reading older than this is no reading (LHM stopped answering).
+const LHM_FRESH: Duration = Duration::from_secs(20);
 
 impl Sensors {
     pub fn new() -> Option<Self> {
@@ -44,54 +59,96 @@ impl Sensors {
             let (p, mut c) = (wide(path), 0isize);
             (unsafe { PdhAddEnglishCounterW(query, p.as_ptr(), 0, &mut c) } == 0).then_some(c)
         };
-        let s = Sensors { query, temp: add(TEMP), load: add(LOAD), freq: add(FREQ), lhm_id: RefCell::new(None), lhm_retry_at: Cell::new(None) };
+        let s = Sensors { query, temp: add(TEMP), load: add(LOAD), busy: add(BUSY), freq: add(FREQ), lhm: Arc::default() };
         // rate counters need two samples; this is the first
         unsafe { PdhCollectQueryData(query) };
         Some(s)
     }
 
-    /// Values since the previous call.
+    /// Values since the previous call. The CPU temperature is the latest one
+    /// the worker thread got; this never waits for the network.
     pub fn read(&self, lhm: &Lhm) -> Readings {
+        let cpu_temp = self.lhm.poll(lhm);
+        self.read_with(cpu_temp)
+    }
+
+    /// Same, but waits for LibreHardwareMonitor: for the command line.
+    pub fn read_now(&self, lhm: &Lhm) -> Readings {
+        let cpu_temp = self.lhm.fetch(lhm);
+        self.read_with(cpu_temp)
+    }
+
+    fn read_with(&self, cpu_temp_c: Option<i32>) -> Readings {
         unsafe { PdhCollectQueryData(self.query) };
+        let pct = |c: Option<isize>| c.and_then(value).map(|v| v.round().clamp(0.0, 999.0) as u32);
         Readings {
-            cpu_temp_c: self.lhm_cpu_temp(lhm),
+            cpu_temp_c,
             // the counter is in kelvin; with several zones, the hottest one
             temp_c: self.temp.and_then(max_value).map(|k| (k - 273.15).round() as i32),
-            cpu_load: self.load.and_then(value).map(|v| v.round().clamp(0.0, 999.0) as u32),
-            cpu_freq: self.freq.and_then(value).map(|v| v.round().clamp(0.0, 999.0) as u32),
+            cpu_load: pct(self.load),
+            cpu_busy: pct(self.busy),
+            cpu_freq: pct(self.freq),
         }
+    }
+}
+
+impl LhmReader {
+    fn backing_off(&self) -> bool {
+        self.retry_at.lock().unwrap().is_some_and(|t| Instant::now() < t)
+    }
+
+    /// The latest fresh reading; starts a new one in the background unless one
+    /// is running or LHM failed a moment ago.
+    fn poll(self: &Arc<Self>, lhm: &Lhm) -> Option<i32> {
+        if lhm.port == 0 {
+            return None;
+        }
+        if !self.backing_off() && !self.running.swap(true, Ordering::AcqRel) {
+            let (me, lhm) = (self.clone(), lhm.clone());
+            std::thread::spawn(move || {
+                me.fetch(&lhm);
+                me.running.store(false, Ordering::Release);
+            });
+        }
+        let latest = *self.latest.lock().unwrap();
+        latest.filter(|(_, at)| at.elapsed() < LHM_FRESH).map(|(t, _)| t)
+    }
+
+    /// One read on the calling thread; remembers it, or backs off on failure.
+    fn fetch(&self, lhm: &Lhm) -> Option<i32> {
+        if lhm.port == 0 || self.backing_off() {
+            return None;
+        }
+        let t = self.read_lhm(lhm);
+        *self.retry_at.lock().unwrap() = t.is_none().then(|| Instant::now() + LHM_RETRY);
+        if let Some(t) = t {
+            *self.latest.lock().unwrap() = Some((t, Instant::now()));
+        }
+        t
     }
 
     /// CPU temperature from LibreHardwareMonitor. The full sensor tree is
     /// ~50 KB, so it's fetched only to find the sensor's id; after that we ask
     /// for that one sensor. If that fails (LHM restarted, id gone), the next
     /// call looks again.
-    fn lhm_cpu_temp(&self, lhm: &Lhm) -> Option<i32> {
-        if lhm.port == 0 || self.lhm_retry_at.get().is_some_and(|t| Instant::now() < t) {
-            return None;
-        }
-        let t = self.lhm_read(lhm);
-        self.lhm_retry_at.set(t.is_none().then(|| Instant::now() + LHM_RETRY));
-        t
-    }
-
-    fn lhm_read(&self, lhm: &Lhm) -> Option<i32> {
-        let cached = self.lhm_id.borrow().clone();
+    fn read_lhm(&self, lhm: &Lhm) -> Option<i32> {
+        let cached = self.id.lock().unwrap().clone();
         if let Some(id) = cached {
             if let Some(t) = lhm_sensor(lhm, &id) {
                 return Some(t);
             }
             // id gone (LHM restarted?): look it up again right away, before backing off
-            *self.lhm_id.borrow_mut() = None;
+            *self.id.lock().unwrap() = None;
         }
         let tree: Value = serde_json::from_str(&http_get(lhm, "/data.json")?).ok()?;
         let (id, t) = cpu_temp_from_json(&tree)?;
-        *self.lhm_id.borrow_mut() = id;
+        *self.id.lock().unwrap() = id;
         Some(t)
     }
 }
 
 /// Where LibreHardwareMonitor's web server is, and how to log in to it.
+#[derive(Clone)]
 pub struct Lhm {
     /// 0 = don't use it.
     pub port: u16,
@@ -312,9 +369,9 @@ mod tests {
     fn finds_the_sensor_once_then_reads_only_it() {
         let (port, server) = fake_lhm(3, None);
         let (s, lhm) = (Sensors::new().unwrap(), Lhm::new(port, "", ""));
-        assert_eq!(s.lhm_cpu_temp(&lhm), Some(50));
-        assert_eq!(s.lhm_cpu_temp(&lhm), Some(61));
-        assert_eq!(s.lhm_cpu_temp(&lhm), Some(61));
+        assert_eq!(s.lhm.fetch(&lhm), Some(50));
+        assert_eq!(s.lhm.fetch(&lhm), Some(61));
+        assert_eq!(s.lhm.fetch(&lhm), Some(61));
         let paths = server.join().unwrap();
         assert_eq!(paths, ["/data.json", "/Sensor?action=Get&id=/intelcpu/0/temperature/8", "/Sensor?action=Get&id=/intelcpu/0/temperature/8"]);
     }
@@ -324,8 +381,8 @@ mod tests {
         // base64("wm:s3cret")
         let (port, server) = fake_lhm(4, Some("Basic d206czNjcmV0"));
         let s = Sensors::new().unwrap();
-        assert_eq!(s.lhm_cpu_temp(&Lhm::new(port, "wm", "s3cret")), Some(50));
-        assert_eq!(s.lhm_cpu_temp(&Lhm::new(port, "wm", "s3cret")), Some(61));
+        assert_eq!(s.lhm.fetch(&Lhm::new(port, "wm", "s3cret")), Some(50));
+        assert_eq!(s.lhm.fetch(&Lhm::new(port, "wm", "s3cret")), Some(61));
         assert!(lhm_problem(&Lhm::new(port, "wm", "wrong")).starts_with("rejected"));
         assert!(lhm_problem(&Lhm::new(port, "", "")).starts_with("wants a password"));
         let paths = server.join().unwrap();
@@ -336,10 +393,34 @@ mod tests {
     fn backs_off_after_a_failed_try() {
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let (s, lhm) = (Sensors::new().unwrap(), Lhm::new(port, "", ""));
-        assert_eq!(s.lhm_cpu_temp(&lhm), None);
+        assert_eq!(s.lhm.fetch(&lhm), None);
         let t = Instant::now();
-        assert_eq!(s.lhm_cpu_temp(&lhm), None);
+        assert_eq!(s.lhm.fetch(&lhm), None);
         assert!(t.elapsed() < Duration::from_millis(50), "second try should not touch the network");
+    }
+
+    #[test]
+    fn reads_in_the_background_without_waiting() {
+        // LHM that answers only after a second, like a closed port does
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut s = listener.incoming().next().unwrap().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            std::thread::sleep(Duration::from_millis(1000));
+            let body = r#"{"Text":"Sensor","Children":[{"Text":"CPU Package","Value":"57.0 °C","SensorId":"/intelcpu/0/temperature/8","Children":[]}]}"#;
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        });
+        let (s, lhm) = (Sensors::new().unwrap(), Lhm::new(port, "", ""));
+        let t = Instant::now();
+        assert_eq!(s.read(&lhm).cpu_temp_c, None);
+        assert!(t.elapsed() < Duration::from_millis(200), "read must not wait for LHM");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while s.lhm.latest.lock().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(s.read(&lhm).cpu_temp_c, Some(57));
     }
 
     #[test]

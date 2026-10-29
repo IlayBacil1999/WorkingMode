@@ -2,7 +2,7 @@
 //! lid events, and the glue that turns engine actions into system calls.
 
 use crate::config::{self, autostart_enabled, clock_in, log, now, set_autostart, Config, SavedState};
-use crate::engine::{fmt_span, Action, AfterAction, EndReason, Engine, Inputs};
+use crate::engine::{fmt_span, Action, AfterAction, EndReason, Engine, HeatSource, Inputs, Readings};
 use crate::power::{self, PowerRequest, GUID_LIDSWITCH_STATE_CHANGE, SCHEME_BALANCED};
 use crate::sensors::Sensors;
 use crate::win::{fill, guid_eq, guid_from_str, guid_to_string, opt_guid_eq, wide};
@@ -86,8 +86,10 @@ struct App {
     sensors: Option<Sensors>,
     /// Last Wi-Fi network seen, to log switches.
     ssid: Option<String>,
-    /// Whether the last reading had a CPU temperature, to log when it comes and goes.
-    cpu_temp_ok: Option<bool>,
+    /// What the heat guard went by on the last tick, to log when it changes.
+    heat_source: Option<HeatSource>,
+    /// The last tick's readings, for the menu.
+    readings: Readings,
     plan_drift_notified: bool,
 }
 
@@ -318,14 +320,7 @@ impl App {
         self.engine.start(now(), secs);
         self.last_net_check = 0;
         self.plan_drift_notified = false;
-        self.cpu_temp_ok = Some(self.inputs().readings.cpu_temp_c.is_some());
-        let no_cpu_temp = self.cfg.lhm_port > 0 && self.cpu_temp_ok == Some(false);
-        if no_cpu_temp {
-            log(&format!(
-                "no CPU temperature: LibreHardwareMonitor {} - the heat guard uses the board sensor",
-                crate::sensors::lhm_problem(&self.cfg.lhm())
-            ));
-        }
+        self.heat_source = None;
         self.save_state();
         log(&format!(
             "session {} - {} - previous plan {}, wifi {}, power request {}",
@@ -347,12 +342,9 @@ impl App {
             let mut body = format!("You can close the lid. The PC keeps working {until}.");
             if let Some(w) = &self.wifi {
                 body += &format!(" Staying on '{}'.", w.ssid);
-                if wifi::profile_mode(&w.profile).as_deref() == Some("manual") {
+                if !resumed && self.cfg.reconnect && wifi::profile_mode(&w.profile).as_deref() == Some("manual") {
                     body += " Tip: this network won't reconnect by itself - fix it in Settings.";
                 }
-            }
-            if no_cpu_temp {
-                body += " No CPU temperature: start LibreHardwareMonitor.";
             }
             let title = if resumed { "Working Mode resumed" } else { "Working Mode is on" };
             self.notify(title, &body, false);
@@ -427,23 +419,11 @@ impl App {
         let inp = self.inputs();
         let acts = self.engine.tick(&inp);
         self.run_actions(acts);
+        self.readings = inp.readings;
         if self.engine.is_on() {
-            let ok = inp.readings.cpu_temp_c.is_some();
-            if self.cfg.lhm_port > 0 && self.cpu_temp_ok != Some(ok) {
-                log(if ok {
-                    "CPU temperature available (LibreHardwareMonitor)"
-                } else {
-                    "CPU temperature lost - LibreHardwareMonitor stopped? The heat guard uses the board sensor"
-                });
-                self.cpu_temp_ok = Some(ok);
-            }
+            self.log_heat_source();
             self.keep_plan_active();
-            let ssid = wifi::current().map(|c| c.ssid);
-            if ssid != self.ssid {
-                let name = |s: &Option<String>| s.as_deref().map_or("none".into(), |s| format!("'{s}'"));
-                log(&format!("wi-fi: {} -> {}", name(&self.ssid), name(&ssid)));
-                self.ssid = ssid;
-            }
+            self.follow_wifi();
         }
         // a check that never answered (e.g. DNS hung) must not stop all later checks
         let busy = self.net_busy_since.is_some_and(|t| inp.now.saturating_sub(t) < NET_CHECK_GIVE_UP_SECS);
@@ -457,6 +437,57 @@ impl App {
                 let ok = wifi::internet_ok();
                 unsafe { PostMessageW(hwnd as HWND, WM_NET, ok as usize, 0) };
             });
+        }
+    }
+
+    /// Logs what the heat guard goes by whenever that changes. The first
+    /// CPU temperature arrives a tick or two after the start (it's read in
+    /// the background), so a session may begin with "load" and move to "CPU".
+    fn log_heat_source(&mut self) {
+        let by = self.engine.heat_source(&self.readings);
+        if self.heat_source == Some(by) {
+            return;
+        }
+        let first = self.heat_source.is_none();
+        self.heat_source = Some(by);
+        log(match by {
+            HeatSource::Cpu => "heat guard: CPU temperature (LibreHardwareMonitor)",
+            HeatSource::Board => "heat guard: board sensor (no CPU temperature)",
+            // at the start LHM's first answer may still be on its way
+            HeatSource::Load if first => "heat guard: CPU load with the lid closed, until a temperature shows up",
+            HeatSource::Load => "heat guard: CPU temperature lost - going by CPU load with the lid closed",
+        });
+    }
+
+    /// Logs Wi-Fi switches, and makes the network in use the one a reconnect
+    /// goes back to: the user (or Ferry) may move to another one mid-session.
+    fn follow_wifi(&mut self) {
+        let conn = wifi::current();
+        let ssid = conn.as_ref().map(|c| c.ssid.clone());
+        if ssid == self.ssid {
+            return;
+        }
+        let name = |s: &Option<String>| s.as_deref().map_or("none".into(), |s| format!("'{s}'"));
+        log(&format!("wi-fi: {} -> {}", name(&self.ssid), name(&ssid)));
+        self.ssid = ssid;
+        if conn.is_some() {
+            self.wifi = conn;
+            self.save_state();
+        }
+    }
+
+    /// The menu's heat line while a session is on.
+    fn heat_line(&self) -> String {
+        let r = &self.readings;
+        let now = match self.engine.heat_source(r) {
+            HeatSource::Cpu => format!("CPU {}C", r.cpu_temp_c.unwrap_or(0)),
+            HeatSource::Board => format!("sensor {}C", r.temp_c.unwrap_or(0)),
+            HeatSource::Load => format!("no temperature sensor, CPU busy {:.0}% avg", self.engine.busy_avg()),
+        };
+        if self.engine.cooling {
+            format!("Heat: COOLING, CPU held at {}% | {now}", self.cfg.cpu_max.min(self.cfg.hot_cpu_max))
+        } else {
+            format!("Heat: ok | {now}")
         }
     }
 
@@ -562,6 +593,9 @@ impl App {
                 None => "",
             };
             item(m, MF_GRAYED, 0, &format!("{bat} | {net}{lid}"));
+            if self.engine.is_on() {
+                item(m, MF_GRAYED, 0, &self.heat_line());
+            }
             if !self.problems.is_empty() {
                 item(m, MF_GRAYED, 0, &format!("Not safe to close the lid: {}", self.problems.join(", ")));
             }
@@ -860,7 +894,8 @@ pub fn run() {
             net_busy_since: None,
             sensors: Sensors::new(),
             ssid: None,
-            cpu_temp_ok: None,
+            heat_source: None,
+            readings: Readings::default(),
             plan_drift_notified: false,
         };
         APP.with(|a| *a.borrow_mut() = Some(app));
