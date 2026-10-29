@@ -90,6 +90,10 @@ struct App {
     heat_source: Option<HeatSource>,
     /// The last tick's readings, for the menu.
     readings: Readings,
+    /// When this app (re)started the session, and whether we already said
+    /// there's no CPU temperature.
+    started: u64,
+    no_temp_notified: bool,
     plan_drift_notified: bool,
 }
 
@@ -321,6 +325,8 @@ impl App {
         self.last_net_check = 0;
         self.plan_drift_notified = false;
         self.heat_source = None;
+        self.started = now();
+        self.no_temp_notified = false;
         self.save_state();
         log(&format!(
             "session {} - {} - previous plan {}, wifi {}, power request {}",
@@ -445,6 +451,15 @@ impl App {
     /// the background), so a session may begin with "load" and move to "CPU".
     fn log_heat_source(&mut self) {
         let by = self.engine.heat_source(&self.readings);
+        // LHM gets a few ticks to answer before we say it's missing, once a session
+        if by != HeatSource::Cpu && self.cfg.lhm_port > 0 && !self.no_temp_notified && now() - self.started >= 20 {
+            self.no_temp_notified = true;
+            self.notify(
+                "No CPU temperature",
+                "LibreHardwareMonitor isn't running. Until it is, the heat guard goes by CPU load.",
+                true,
+            );
+        }
         if self.heat_source == Some(by) {
             return;
         }
@@ -896,6 +911,8 @@ pub fn run() {
             ssid: None,
             heat_source: None,
             readings: Readings::default(),
+            started: 0,
+            no_temp_notified: false,
             plan_drift_notified: false,
         };
         APP.with(|a| *a.borrow_mut() = Some(app));
