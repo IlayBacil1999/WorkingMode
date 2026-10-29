@@ -1,6 +1,7 @@
 //! The tray app: hidden window, tray icon + menu, balloon notifications,
 //! lid events, and the glue that turns engine actions into system calls.
 
+use crate::claude;
 use crate::config::{self, autostart_enabled, clock_in, log, now, set_autostart, Config, SavedState};
 use crate::engine::{fmt_span, Action, AfterAction, EndReason, Engine, HeatSource, Inputs, Readings};
 use crate::power::{self, PowerRequest, GUID_LIDSWITCH_STATE_CHANGE, SCHEME_BALANCED};
@@ -54,6 +55,9 @@ const BATTERY_CHOICES: [(u8, &str); 4] =
     [(10, "Stop at 10%"), (15, "Stop at 15% (recommended)"), (25, "Stop at 25%"), (0, "Off")];
 
 const ID_START: usize = 100;
+const ID_START_CLAUDE: usize = 150;
+const ID_CLAUDE_SETUP: usize = 151;
+const ID_CLAUDE_REMOVE: usize = 152;
 const ID_EXTEND: usize = 200;
 const ID_STOP: usize = 201;
 const ID_KEEP: usize = 202;
@@ -130,6 +134,11 @@ fn open_in_notepad(path: &std::path::Path) {
     // quoted: the profile path may contain spaces
     let (op, file, notepad) = (wide("open"), wide(&format!("\"{}\"", path.display())), wide(&notepad));
     unsafe { ShellExecuteW(null_mut(), op.as_ptr(), notepad.as_ptr(), file.as_ptr(), null(), SW_SHOWNORMAL) };
+}
+
+fn confirm(text: &str) -> bool {
+    let (t, c) = (wide(text), wide("Working Mode"));
+    unsafe { MessageBoxW(null_mut(), t.as_ptr(), c.as_ptr(), MB_YESNO | MB_ICONQUESTION) == IDYES }
 }
 
 fn message_box(text: &str) {
@@ -228,6 +237,7 @@ impl App {
         let (icon, tip) = match &self.engine.session {
             None => (self.icons.off, "Working Mode: off".to_string()),
             Some(_) if !self.problems.is_empty() => (self.icons.warn, "Working Mode: ON - NOT safe to close the lid".into()),
+            Some(s) if s.while_claude => (self.icons.on, format!("Working Mode: ON - {}", self.claude_status())),
             Some(_) => match self.engine.secs_left(now()) {
                 Some(left) => (self.icons.on, format!("Working Mode: ON - {} left", fmt_span(left))),
                 None => (self.icons.on, "Working Mode: ON - until you stop it".into()),
@@ -257,6 +267,11 @@ impl App {
             idle_secs: power::idle_secs(),
             battery: power::battery(),
             readings: self.sensors.as_ref().map(|s| s.read(&self.cfg.lhm())).unwrap_or_default(),
+            claude_busy: if self.engine.session.as_ref().is_some_and(|s| s.while_claude) {
+                claude::busy_sessions(&claude::dir(), now())
+            } else {
+                0
+            },
         }
     }
 
@@ -267,6 +282,7 @@ impl App {
                 started_at: s.started_at,
                 ends_at: s.ends_at,
                 wifi_profile: self.wifi.as_ref().map(|w| w.profile.clone()),
+                while_claude: s.while_claude,
             }
             .save(),
             // no session, but a plan to put back (starting, or a restore that failed):
@@ -276,6 +292,7 @@ impl App {
                 started_at: now(),
                 ends_at: Some(now()),
                 wifi_profile: None,
+                while_claude: false,
             }
             .save(),
             (_, None) => SavedState::clear(),
@@ -302,7 +319,10 @@ impl App {
     }
 
     /// `secs = None` runs until stopped. `previous` is set when resuming after a crash.
-    fn start(&mut self, secs: Option<u64>, previous: Option<GUID>, resumed: bool) {
+    /// `while_claude`: no end time; ends once Claude Code has been quiet.
+    fn start(&mut self, secs: Option<u64>, while_claude: bool, previous: Option<GUID>, resumed: bool) {
+        // read before the state is rewritten below
+        let saved_profile = if resumed { SavedState::load().and_then(|s| s.wifi_profile) } else { None };
         let active = power::active_scheme().ok();
         let plan = self.cfg.plan_guid.as_deref().and_then(guid_from_str);
         let prev = previous.or(active).filter(|g| !opt_guid_eq(Some(*g), plan)).unwrap_or(SCHEME_BALANCED);
@@ -319,9 +339,17 @@ impl App {
             log("couldn't create the watchdog task - if the app dies, nothing restarts it");
         }
         self.request = if self.cfg.hold_power_request { PowerRequest::new() } else { None };
-        self.wifi = wifi::current();
+        // after a reboot Wi-Fi may not be up yet: fall back to the saved profile
+        self.wifi = wifi::current().or_else(|| {
+            let profile = saved_profile?;
+            Some(wifi::Connection { ssid: profile.clone(), profile, signal: 0 })
+        });
         self.ssid = self.wifi.as_ref().map(|w| w.ssid.clone());
-        self.engine.start(now(), secs);
+        if while_claude {
+            self.engine.start_while_claude(now());
+        } else {
+            self.engine.start(now(), secs);
+        }
         self.last_net_check = 0;
         self.plan_drift_notified = false;
         self.heat_source = None;
@@ -331,7 +359,7 @@ impl App {
         log(&format!(
             "session {} - {} - previous plan {}, wifi {}, power request {}",
             if resumed { "resumed" } else { "started" },
-            secs.map_or("until stopped".into(), fmt_span),
+            if while_claude { "while Claude works".into() } else { secs.map_or("until stopped".into(), fmt_span) },
             guid_to_string(&prev),
             self.wifi.as_ref().map_or("none".into(), |w| format!("'{}' (profile '{}', signal {}%)", w.ssid, w.profile, w.signal)),
             if self.request.is_some() { "held" } else { "off" },
@@ -344,7 +372,14 @@ impl App {
                 true,
             );
         } else {
-            let until = secs.map_or("until you stop it".into(), |s| format!("until {}", clock_in(s)));
+            let until = match secs {
+                _ if while_claude => format!(
+                    "while Claude works, until it has been quiet for {}",
+                    fmt_span(self.engine.params.claude_quiet_secs)
+                ),
+                Some(s) => format!("until {}", clock_in(s)),
+                None => "until you stop it".into(),
+            };
             let mut body = format!("You can close the lid. The PC keeps working {until}.");
             if let Some(w) = &self.wifi {
                 body += &format!(" Staying on '{}'.", w.ssid);
@@ -379,6 +414,7 @@ impl App {
             EndReason::Timer => "Time's up. Normal power settings are back.",
             EndReason::User => "Normal power settings are back.",
             EndReason::Battery => "Battery is low. Normal power settings are back.",
+            EndReason::ClaudeDone => "Claude is done. Normal power settings are back.",
         };
         self.notify("Working Mode is off", body, false);
         self.update_tray();
@@ -451,12 +487,15 @@ impl App {
     /// the background), so a session may begin with "load" and move to "CPU".
     fn log_heat_source(&mut self) {
         let by = self.engine.heat_source(&self.readings);
-        // LHM gets a few ticks to answer before we say it's missing, once a session
-        if by != HeatSource::Cpu && self.cfg.lhm_port > 0 && !self.no_temp_notified && now() - self.started >= 20 {
+        // LHM gets time to answer (it may still be starting after a reboot, and a
+        // failed try waits a minute) before we say it's missing, once a session
+        let waited = now().saturating_sub(self.started) >= 90;
+        if by != HeatSource::Cpu && self.cfg.lhm_port > 0 && self.cfg.hot_cpu_temp_c > 0 && !self.no_temp_notified && waited {
             self.no_temp_notified = true;
+            let fallback = if self.cfg.hot_load_pct > 0 { "goes by CPU load" } else { "has nothing to go by" };
             self.notify(
                 "No CPU temperature",
-                "LibreHardwareMonitor isn't running. Until it is, the heat guard goes by CPU load.",
+                &format!("LibreHardwareMonitor isn't answering (not running, or its web server is off). Until it does, the heat guard {fallback}."),
                 true,
             );
         }
@@ -474,21 +513,26 @@ impl App {
         });
     }
 
-    /// Logs Wi-Fi switches, and makes the network in use the one a reconnect
-    /// goes back to: the user (or Ferry) may move to another one mid-session.
+    /// Logs Wi-Fi switches.
     fn follow_wifi(&mut self) {
-        let conn = wifi::current();
-        let ssid = conn.as_ref().map(|c| c.ssid.clone());
-        if ssid == self.ssid {
+        let ssid = wifi::current().map(|c| c.ssid);
+        if ssid != self.ssid {
+            let name = |s: &Option<String>| s.as_deref().map_or("none".into(), |s| format!("'{s}'"));
+            log(&format!("wi-fi: {} -> {}", name(&self.ssid), name(&ssid)));
+            self.ssid = ssid;
+        }
+    }
+
+    /// The network a reconnect goes back to is the last one that had internet:
+    /// the user (or Ferry) may move to another one mid-session, but a network
+    /// Windows joins on its own after a drop isn't trusted until it works.
+    fn remember_working_wifi(&mut self) {
+        let Some(conn) = wifi::current() else { return };
+        if self.wifi.as_ref().is_some_and(|w| w.profile == conn.profile) {
             return;
         }
-        let name = |s: &Option<String>| s.as_deref().map_or("none".into(), |s| format!("'{s}'"));
-        log(&format!("wi-fi: {} -> {}", name(&self.ssid), name(&ssid)));
-        self.ssid = ssid;
-        if conn.is_some() {
-            self.wifi = conn;
-            self.save_state();
-        }
+        log(&format!("reconnect target is now '{}' (it has internet)", conn.ssid));
+        self.wifi = Some(conn);
     }
 
     /// The menu's heat line while a session is on.
@@ -503,6 +547,41 @@ impl App {
             format!("Heat: COOLING, CPU held at {}% | {now}", self.cfg.cpu_max.min(self.cfg.hot_cpu_max))
         } else {
             format!("Heat: ok | {now}")
+        }
+    }
+
+    /// "N Claude sessions busy" or "Claude quiet for 3 min (ends at 10)".
+    fn claude_status(&self) -> String {
+        let t = now();
+        let quiet = fmt_span(self.engine.params.claude_quiet_secs);
+        match self.engine.claude_quiet_for(t) {
+            Some(q) => format!("Claude quiet for {} (ends at {quiet})", fmt_span(q)),
+            None => "while Claude works".into(),
+        }
+    }
+
+    /// Our hooks are in Claude Code's settings and point at this exe.
+    fn claude_hooks(&self) -> bool {
+        let exe = std::env::current_exe().ok();
+        claude::settings_path().zip(exe).is_some_and(|(p, exe)| claude::hooks_installed(&p, &exe))
+    }
+
+    fn set_claude_hooks(&mut self, on: bool) {
+        let exe = std::env::current_exe().ok();
+        let result = match (claude::settings_path(), &exe) {
+            (Some(path), Some(exe)) => claude::set_hooks(&path, on.then_some(exe.as_path())),
+            _ => Err("can't find the user profile or this exe".into()),
+        };
+        match result {
+            Ok(()) if on => {
+                log("added the Claude Code hooks");
+                self.notify("Claude Code hooks added", "Choose \"Start while Claude works\" in the menu.", false);
+            }
+            Ok(()) => log("removed the Claude Code hooks"),
+            Err(e) => {
+                log(&format!("Claude Code hooks: {e}"));
+                self.notify("Couldn't change Claude Code's settings", &e, true);
+            }
         }
     }
 
@@ -530,6 +609,9 @@ impl App {
     fn on_net(&mut self, online: bool) {
         self.net_busy_since = None;
         self.last_net_check = now();
+        if online && self.engine.is_on() {
+            self.remember_working_wifi();
+        }
         let acts = self.engine.on_net(now(), online);
         self.run_actions(acts);
     }
@@ -542,7 +624,7 @@ impl App {
         match SavedState::load() {
             Some(s) if s.ends_at.is_none_or(|e| e > now() + 60) => {
                 let prev = guid_from_str(&s.previous_scheme);
-                self.start(s.ends_at.map(|e| e - now()), prev, true);
+                self.start(s.ends_at.map(|e| e - now()), s.while_claude, prev, true);
             }
             Some(s) => {
                 self.previous = guid_from_str(&s.previous_scheme);
@@ -585,6 +667,7 @@ impl App {
 
             let header = match (&self.engine.session, &self.engine.countdown) {
                 (_, Some(c)) => format!("Ending - {} in {} s", if c.after == AfterAction::Hibernate { "hibernate" } else { "sleep" }, c.at.saturating_sub(t)),
+                (Some(s), None) if s.while_claude => format!("ON - {}", self.claude_status()),
                 (Some(s), None) => match s.ends_at {
                     Some(e) => format!("ON - {} left (until {})", fmt_span(e.saturating_sub(t)), clock_in(e.saturating_sub(t))),
                     None => "ON - until you stop it".into(),
@@ -626,6 +709,11 @@ impl App {
                 for (i, (label, _)) in PRESETS.iter().enumerate() {
                     item(m, MF_STRING, ID_START + i, &format!("Start for {label}"));
                 }
+                if self.claude_hooks() {
+                    item(m, MF_STRING, ID_START_CLAUDE, "Start while Claude works");
+                } else {
+                    item(m, MF_STRING, ID_CLAUDE_SETUP, "Start while Claude works (set up)...");
+                }
             }
             item(m, MF_SEPARATOR, 0, "");
 
@@ -653,6 +741,9 @@ impl App {
                     item(settings, MF_STRING, ID_FIX_PROFILE, &format!("Make '{}' reconnect automatically", c.ssid));
                 }
             }
+            if claude::settings_path().is_some_and(|p| claude::any_hooks(&p)) {
+                item(settings, MF_STRING, ID_CLAUDE_REMOVE, "Remove the Claude Code hooks");
+            }
             item(settings, MF_SEPARATOR, 0, "");
             item(settings, MF_STRING, ID_CONFIG, "Advanced settings (config.json)");
             item(m, MF_POPUP, settings as usize, "Settings");
@@ -668,8 +759,28 @@ impl App {
         match id {
             _ if (ID_START..ID_START + PRESETS.len()).contains(&id) => {
                 let secs = PRESETS[id - ID_START].1;
-                self.start((secs > 0).then_some(secs), None, false);
+                self.start((secs > 0).then_some(secs), false, None, false);
             }
+            ID_START_CLAUDE => self.start(None, true, None, false),
+            ID_CLAUDE_SETUP => {
+                let ask = "\"While Claude works\" keeps the PC working while Claude Code is busy, \
+                           and ends once it has been quiet for a while.\n\n\
+                           To know when Claude is busy, Working Mode adds a few hooks to Claude Code's \
+                           settings (%USERPROFILE%\\.claude\\settings.json). They only note when a \
+                           session works; nothing else in the file changes, and a copy of it is kept.\n\n\
+                           Sessions already open start reporting once restarted.\n\nAdd the hooks?";
+                if !claude::git_bash_found() {
+                    message_box(
+                        "\"While Claude works\" needs Git for Windows (Git Bash): Claude Code runs the hooks with it.                          Install Git, then try again.",
+                    );
+                } else if confirm(ask) {
+                    self.set_claude_hooks(true);
+                    if self.claude_hooks() {
+                        self.start(None, true, None, false);
+                    }
+                }
+            }
+            ID_CLAUDE_REMOVE => self.set_claude_hooks(false),
             ID_EXTEND => {
                 let acts = self.engine.extend(t, 3600);
                 self.run_actions(acts);

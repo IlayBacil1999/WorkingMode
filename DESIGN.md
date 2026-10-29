@@ -93,13 +93,22 @@ After applying, the app **reads every critical value back**. If any failed, the 
 | `wifi.rs` | WLAN API: current profile/SSID, profile connection mode, reconnect; HTTP internet probe |
 | `config.rs` | config/state JSON, paths, log, autostart key |
 | `app.rs` | tray icon, menu, notifications, lid events, glue between engine and OS |
+| `claude.rs` | "While Claude works": the hook, busy-session count, settings.json hooks install/remove |
 | `main.rs` | CLI (`--selftest`, `--restore`, `--uninstall`), single instance, message loop |
 
 Stack: `windows-sys` (raw Win32, one native dependency) + `serde`/`serde_json`. No webview and no GUI framework. Native tray menu and balloon notifications (these show as toasts on Windows 11, no AppUserModelID needed).
 
-## 8. Later (v2)
+## 8. While Claude works
 
-- "While Claude works": stay on while a Claude Code session is busy, end after N quiet minutes.
+A session with no end time that ends once no Claude Code session has worked for `claude_quiet_mins` (10). Then it ends like the timer: restore with the lid open, the 60 s countdown and sleep with it closed. Battery floor and heat guard work as usual.
+
+- **How it knows:** Claude Code hooks in `~/.claude/settings.json` (UserPromptSubmit, Pre/PostToolUse, Stop, SubagentStop, SessionEnd) run `working-mode.exe --claude-hook`, async and under Git Bash. The tray menu adds them after a confirm box ("Start while Claude works (set up)..."), or `--claude-setup` / `--claude-remove`. The rest of the file is kept as is, and the first original is kept as `settings.json.before-working-mode`.
+- **Busy session** (`claude.rs`, one file per fact so concurrent hooks don't clash): a turn is running and had an event in the last 30 min; or the turn stopped with background work still running (up to 4 h); or any event in the last 2 min (subagents).
+- **Known limits:** Esc sends no Stop, so an interrupted turn counts as busy for up to 30 min. Sessions open before the setup report only after a restart.
+- **"+1 hour" / "Keep working"** during the end countdown: wait for quiet again. Claude working again during the countdown cancels it.
+
+## 9. Later
+
 - "Until HH:MM".
 - Small status window: session timeline, drops, battery graph.
 - Signed build.

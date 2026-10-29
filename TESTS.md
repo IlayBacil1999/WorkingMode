@@ -35,6 +35,7 @@ A good run has an `alive` line every minute, no `GAP`, and `online=yes`.
 | **T12** | Watchdog | While ON: Task Manager › end `working-mode.exe`, then wait up to 5 min (or `schtasks /run /tn WorkingModeWatchdog`) | Log shows `watchdog: … starting it` then `session resumed`; after a clean stop, `schtasks /query /tn WorkingModeWatchdog` finds nothing | that a crash in the bag is recovered |
 | **T13** | Plan switched by something else | While ON: `powercfg /setactive SCHEME_BALANCED` | Within 5 s the log shows `power plan was switched … switching back` and the Working Mode plan is active again | plan drift |
 | **T14** | Heat guard without a temperature sensor | Start for 1 hour, close the lid, run a heavy job for 10 min (e.g. a `cargo build --release` of a big project). LibreHardwareMonitor off | The log shows `heat guard: CPU load …`, `busy=` near 100 in `alive` lines, then `hot: CPU busy …` and `CPU limit now 60%` after ~4–5 min. After the job, `cooled: …` within ~5 min | `hot_load_pct` (80), `hot_cpu_max` (60) |
+| **T15** | While Claude works | Menu › "Start while Claude works (set up)..." › Yes. Restart Claude Code. Give it a 20-min task, close the lid | `claude  busy sessions=1` lines while it works; 10 min after it finishes, `no Claude session has worked for 10 min - ending`, countdown, sleep | `claude_quiet_mins`; that the hooks fire in the desktop app |
 | **T10** | Long run with Claude Code | Start 2–4 h, give Claude Code a long task, close the lid | The task finishes; the log is clean | the real goal |
 
 ## Reading results back

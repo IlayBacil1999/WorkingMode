@@ -42,6 +42,8 @@ pub struct Config {
     pub reconnect: bool,
     pub net_check_secs: u64,
     pub reconnect_after_secs: u64,
+    /// "While Claude works" ends after Claude Code has been quiet this long.
+    pub claude_quiet_mins: u64,
     /// Heat guard: after 30 s at this CPU temperature the CPU limit drops to
     /// `hot_cpu_max` for at least 5 min, until it's 10 degrees cooler. 0 = off.
     /// Needs LibreHardwareMonitor; without it `hot_temp_c` on the board sensor
@@ -78,6 +80,7 @@ impl Default for Config {
             reconnect: true,
             net_check_secs: 60,
             reconnect_after_secs: 90,
+            claude_quiet_mins: 10,
             hot_cpu_temp_c: 85,
             hot_temp_c: 60,
             hot_load_pct: 80,
@@ -123,6 +126,7 @@ impl Config {
             warn_before_secs: self.warn_before_mins * 60,
             countdown_secs: self.countdown_secs,
             away_idle_secs: self.away_idle_secs,
+            claude_quiet_secs: self.claude_quiet_mins * 60,
             reconnect: self.reconnect,
             reconnect_after_secs: self.reconnect_after_secs,
             hot_cpu_temp_c: self.hot_cpu_temp_c,
@@ -139,6 +143,9 @@ pub struct SavedState {
     pub started_at: u64,
     pub ends_at: Option<u64>,
     pub wifi_profile: Option<String>,
+    /// "While Claude works": ends when Claude is quiet, not at `ends_at`.
+    #[serde(default)]
+    pub while_claude: bool,
 }
 
 impl SavedState {
@@ -158,12 +165,16 @@ impl SavedState {
 }
 
 /// Write to a temp file, then rename over the target, so a crash or a dead
-/// battery mid-write can't leave half a file.
-fn write_atomic(path: &std::path::Path, text: &str) {
-    let tmp = path.with_extension("tmp");
-    if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, path).is_err() {
-        let _ = fs::write(path, text);
+/// battery mid-write can't leave half a file. The temp name carries the
+/// process id: Claude hooks may write the same file from two processes.
+/// Returns whether the text got there.
+pub fn write_atomic(path: &std::path::Path, text: &str) -> bool {
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, path).is_ok() {
+        return true;
     }
+    let _ = fs::remove_file(&tmp);
+    fs::write(path, text).is_ok()
 }
 
 pub fn data_dir() -> PathBuf {

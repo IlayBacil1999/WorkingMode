@@ -7,12 +7,16 @@
 //!   working-mode.exe --extend [N] add N minutes (default 60) to the running session
 //!   working-mode.exe --stop       stop the running session
 //!   working-mode.exe --watchdog   run by a scheduled task: restart the app if a session lost it
+//!   working-mode.exe --claude-hook       run by Claude Code hooks (see claude.rs)
+//!   working-mode.exe --claude-setup      add those hooks to Claude Code's settings
+//!   working-mode.exe --claude-remove     take them out again
 //!   working-mode.exe --restore    emergency: put normal power settings back
 //!   working-mode.exe --uninstall  restore, delete the plan, autostart and data
 
 #![windows_subsystem = "windows"]
 
 mod app;
+mod claude;
 mod config;
 mod engine;
 mod power;
@@ -34,6 +38,10 @@ fn main() {
         app::run();
         return;
     };
+    // runs on every Claude Code tool call: no console, no output, no delay
+    if arg == "--claude-hook" {
+        std::process::exit(claude::hook());
+    }
     // GUI-subsystem exe: borrow the terminal's console for output
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     let code = match arg.as_str() {
@@ -51,6 +59,29 @@ fn main() {
         },
         "--stop" => remote(app::REMOTE_STOP, 0),
         "--watchdog" => watchdog::run(app_running()),
+        "--claude-setup" | "--claude-remove" => {
+            let install = arg == "--claude-setup";
+            let exe = std::env::current_exe().ok();
+            let result = match (claude::settings_path(), &exe) {
+                _ if install && !claude::git_bash_found() => Err("Claude Code runs these hooks with Git Bash, and it isn't installed".into()),
+                (Some(path), Some(exe)) => claude::set_hooks(&path, install.then_some(exe.as_path())).map(|()| path),
+                _ => Err("can't find the user profile or this exe".into()),
+            };
+            match result {
+                Ok(path) if install => {
+                    println!("Added the hooks to {}. New Claude Code sessions report to Working Mode.", path.display());
+                    0
+                }
+                Ok(path) => {
+                    println!("Removed the hooks from {}.", path.display());
+                    0
+                }
+                Err(e) => {
+                    println!("{e}");
+                    1
+                }
+            }
+        }
         _ => {
             println!("usage: working-mode.exe [--status | --extend [minutes] | --stop | --selftest | --restore | --uninstall]");
             2
@@ -161,6 +192,10 @@ fn status() -> i32 {
     let sensors = sensors::Sensors::new();
     let t = config::now();
     match SavedState::load() {
+        Some(s) if s.while_claude => println!(
+            "session              ON, while Claude works ({} Claude session(s) busy now)",
+            claude::busy_sessions(&claude::dir(), t)
+        ),
         Some(s) => match s.ends_at {
             Some(e) => println!(
                 "session              ON, {} left (until {})",

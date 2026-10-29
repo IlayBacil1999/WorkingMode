@@ -18,6 +18,8 @@ pub enum EndReason {
     Timer,
     User,
     Battery,
+    /// "While Claude works": every Claude session has been quiet long enough.
+    ClaudeDone,
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +29,8 @@ pub struct Params {
     pub warn_before_secs: u64,
     pub countdown_secs: u64,
     pub away_idle_secs: u64,
+    /// "While Claude works" ends after Claude has been quiet this long.
+    pub claude_quiet_secs: u64,
     pub reconnect: bool,
     pub reconnect_after_secs: u64,
     /// Lower the CPU limit at this CPU temperature (LibreHardwareMonitor); 0 = off.
@@ -70,6 +74,8 @@ pub struct Inputs {
     pub idle_secs: u64,
     pub battery: Option<Battery>,
     pub readings: Readings,
+    /// Claude Code sessions working right now (read only in "while Claude works").
+    pub claude_busy: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,6 +84,8 @@ pub struct Session {
     /// `None` = until the user stops it.
     pub ends_at: Option<u64>,
     pub warned: bool,
+    /// Ends when Claude Code has been quiet for `claude_quiet_secs`.
+    pub while_claude: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -140,10 +148,15 @@ pub struct Engine {
     cooling_since: u64,
     /// Lowest and highest board reading this session.
     board_range: Option<(i32, i32)>,
-    /// Moving average of `cpu_busy`, and when it was last fed.
+    /// Moving averages of `cpu_busy` and `cpu_load`, and when they were last fed.
     busy_avg: f64,
+    work_avg: f64,
+    /// Which source the running 30 s hot count is for.
+    hot_by: Option<HeatSource>,
     busy_at: Option<u64>,
     battery_alerted: bool,
+    /// Since when no Claude session has been working.
+    claude_quiet_since: Option<u64>,
     offline_since: Option<u64>,
     last_reconnect: Option<u64>,
     last_tick: Option<u64>,
@@ -179,8 +192,11 @@ impl Engine {
             cooling_since: 0,
             board_range: None,
             busy_avg: 0.0,
+            work_avg: 0.0,
+            hot_by: None,
             busy_at: None,
             battery_alerted: false,
+            claude_quiet_since: None,
             offline_since: None,
             last_reconnect: None,
             last_tick: None,
@@ -199,18 +215,34 @@ impl Engine {
     /// Called after the app has applied the power plan successfully.
     /// `secs = None` runs until stopped. Also used to resume after a crash.
     pub fn start(&mut self, now: u64, secs: Option<u64>) {
-        self.session = Some(Session { started_at: now, ends_at: secs.map(|s| now + s), warned: false });
+        self.session = Some(Session { started_at: now, ends_at: secs.map(|s| now + s), warned: false, while_claude: false });
+        self.claude_quiet_since = None;
         self.countdown = None;
         self.cooling = false;
         self.hot_since = None;
         self.board_range = None;
         self.busy_avg = 0.0;
+        self.work_avg = 0.0;
+        self.hot_by = None;
         self.busy_at = None;
         self.battery_alerted = false;
         self.offline_since = None;
         self.last_reconnect = None;
         self.last_tick = None;
         self.last_heartbeat = now;
+    }
+
+    /// Like `start` with no end time, ending instead once Claude Code goes quiet.
+    pub fn start_while_claude(&mut self, now: u64) {
+        self.start(now, None);
+        if let Some(s) = self.session.as_mut() {
+            s.while_claude = true;
+        }
+    }
+
+    /// In "while Claude works": how long no Claude session has worked, if so.
+    pub fn claude_quiet_for(&self, now: u64) -> Option<u64> {
+        self.claude_quiet_since.map(|t| now.saturating_sub(t))
     }
 
     pub fn extend(&mut self, now: u64, secs: u64) -> Vec<Action> {
@@ -221,6 +253,12 @@ impl Engine {
             self.countdown = None;
         }
         let Some(end) = s.ends_at else {
+            if s.while_claude {
+                // "+1 hour" here means: don't end now, wait for quiet again
+                self.claude_quiet_since = None;
+                let quiet = fmt_span(self.params.claude_quiet_secs);
+                return vec![notify("Working Mode runs while Claude works", format!("It ends after Claude has been quiet for {quiet}."))];
+            }
             return vec![notify("Working Mode runs until you stop it", "There's no end time to extend.")];
         };
         let base = end.max(now);
@@ -248,6 +286,11 @@ impl Engine {
             // the timer already ran out: keeping going means another hour
             EndReason::Timer => self.extend(now, 3600),
             EndReason::Battery => vec![notify("Working Mode keeps running", "Battery safety is paused until you plug in.")],
+            EndReason::ClaudeDone => {
+                self.claude_quiet_since = None;
+                let quiet = fmt_span(self.params.claude_quiet_secs);
+                vec![notify("Working Mode keeps running", format!("It ends after Claude has been quiet for {quiet} again."))]
+            }
         }
     }
 
@@ -285,6 +328,7 @@ impl Engine {
             EndReason::Timer => "Time's up.".to_string(),
             EndReason::User => "Stopped.".to_string(),
             EndReason::Battery => format!("Battery is at {}%.", inp.battery.map_or(0, |b| b.percent)),
+            EndReason::ClaudeDone => "Claude is done.".to_string(),
         };
         vec![warn(
             &format!("{what} in {} s", self.params.countdown_secs),
@@ -308,6 +352,14 @@ impl Engine {
         self.last_tick = Some(inp.now);
 
         if let Some(c) = self.countdown.clone() {
+            if c.reason == EndReason::ClaudeDone && inp.claude_busy > 0 {
+                // Claude took up work again (a remote prompt, background work waking up)
+                self.countdown = None;
+                self.claude_quiet_since = None;
+                acts.push(Action::Log("Claude is working again - not ending".into()));
+                acts.push(notify("Working Mode keeps running", "Claude is working again."));
+                return acts;
+            }
             if self.present(inp) {
                 // the user came back during the countdown: end without suspending
                 self.countdown = None;
@@ -352,6 +404,22 @@ impl Engine {
                 opt(r.cpu_freq),
                 if self.cooling { "  COOLING" } else { "" },
             )));
+            if self.session.as_ref().is_some_and(|s| s.while_claude) {
+                acts.push(Action::Log(format!("claude  busy sessions={}", inp.claude_busy)));
+            }
+        }
+
+        if self.session.as_ref().is_some_and(|s| s.while_claude) {
+            if inp.claude_busy > 0 {
+                self.claude_quiet_since = None;
+            } else {
+                let since = *self.claude_quiet_since.get_or_insert(inp.now);
+                if inp.now.saturating_sub(since) >= self.params.claude_quiet_secs {
+                    acts.push(Action::Log(format!("no Claude session has worked for {} - ending", fmt_span(inp.now.saturating_sub(since)))));
+                    acts.extend(self.finish(EndReason::ClaudeDone, inp));
+                    return acts;
+                }
+            }
         }
 
         let s = self.session.as_mut().unwrap();
@@ -382,17 +450,23 @@ impl Engine {
         acts
     }
 
-    /// Feeds the board range and the busy average; called every tick.
+    /// Feeds the board range and the load averages; called every tick.
     fn track(&mut self, inp: &Inputs) {
         let r = inp.readings;
         if let Some(t) = r.temp_c {
             let (lo, hi) = self.board_range.get_or_insert((t, t));
             (*lo, *hi) = ((*lo).min(t), (*hi).max(t));
         }
+        // a long gap (sleep) counts as one minute, not as hours at this reading
+        let dt = self.busy_at.map_or(0, |t| inp.now.saturating_sub(t)).min(60) as f64;
+        let k = (dt / BUSY_AVG_SECS).min(1.0);
         if let Some(b) = r.cpu_busy {
-            // a long gap (sleep) counts as one minute, not as hours at this reading
-            let dt = self.busy_at.map_or(0, |t| inp.now.saturating_sub(t)).min(60) as f64;
-            self.busy_avg += (b.min(100) as f64 - self.busy_avg) * (dt / BUSY_AVG_SECS).min(1.0);
+            self.busy_avg += (b.min(100) as f64 - self.busy_avg) * k;
+        }
+        if let Some(u) = r.cpu_load {
+            self.work_avg += (u.min(100) as f64 - self.work_avg) * k;
+        }
+        if r.cpu_busy.is_some() || r.cpu_load.is_some() {
             self.busy_at = Some(inp.now);
         }
     }
@@ -405,7 +479,8 @@ impl Engine {
         self.board_range.is_some_and(|(lo, hi)| hi - lo >= BOARD_MOVES_C)
     }
 
-    /// What the heat guard goes by with these readings.
+    /// What the heat guard goes by with these readings. Without a CPU
+    /// temperature it watches CPU load, and the board sensor too once it moves.
     pub fn heat_source(&self, r: &Readings) -> HeatSource {
         if r.cpu_temp_c.is_some() {
             HeatSource::Cpu
@@ -416,22 +491,53 @@ impl Engine {
         }
     }
 
-    /// Current value, limit, hysteresis, and how to say it, for one source.
-    fn heat_signal(&self, by: HeatSource, inp: &Inputs) -> (Option<i32>, i32, i32, fn(i32) -> String) {
+    /// The sources to watch for heat, best first.
+    fn heat_candidates(&self, r: &Readings) -> Vec<HeatSource> {
+        match self.heat_source(r) {
+            HeatSource::Cpu => vec![HeatSource::Cpu],
+            // a board sensor that moves a little may never reach its limit: load still counts
+            HeatSource::Board => vec![HeatSource::Board, HeatSource::Load],
+            HeatSource::Load => vec![HeatSource::Load],
+        }
+    }
+
+    /// Current value, limit, and how to say it, for one source, to start cooling.
+    fn heat_signal(&self, by: HeatSource, inp: &Inputs) -> (Option<i32>, i32, fn(i32) -> String) {
         let r = inp.readings;
         match by {
-            HeatSource::Cpu => (r.cpu_temp_c, self.params.hot_cpu_temp_c, CPU_HYSTERESIS_C, |t| format!("CPU at {t}C")),
-            HeatSource::Board => (
-                r.temp_c.filter(|_| self.board_moves()),
-                self.params.hot_temp_c,
-                BOARD_HYSTERESIS_C,
-                |t| format!("Sensor at {t}C"),
-            ),
+            HeatSource::Cpu => (r.cpu_temp_c, self.params.hot_cpu_temp_c, |t| format!("CPU at {t}C")),
+            HeatSource::Board => (r.temp_c.filter(|_| self.board_moves()), self.params.hot_temp_c, |t| format!("Sensor at {t}C")),
             HeatSource::Load => (
                 r.cpu_busy.map(|_| self.busy_avg.round() as i32),
                 self.params.hot_load_pct as i32,
-                LOAD_HYSTERESIS_PCT,
                 |p| format!("CPU busy {p}% for minutes with the lid closed"),
+            ),
+        }
+    }
+
+    /// Value and the level at or under which cooling may lift, for one source.
+    fn cool_signal(&self, by: HeatSource, inp: &Inputs) -> (Option<i32>, i32, fn(i32) -> String) {
+        let r = inp.readings;
+        let p = &self.params;
+        match by {
+            HeatSource::Cpu => (r.cpu_temp_c, p.hot_cpu_temp_c - CPU_HYSTERESIS_C, |t| format!("CPU at {t}C")),
+            HeatSource::Board => (
+                r.temp_c.filter(|_| self.board_moves()),
+                p.hot_temp_c - BOARD_HYSTERESIS_C,
+                |t| format!("Sensor at {t}C"),
+            ),
+            // Busy time can't say the job is over: capped, the same job keeps the
+            // CPU busy longer. Work done (busy x speed) can, so lifting goes by that.
+            // without the utility counter, busy time is all there is
+            HeatSource::Load if r.cpu_load.is_none() => (
+                r.cpu_busy.map(|_| self.busy_avg.round() as i32),
+                p.hot_load_pct as i32 - LOAD_HYSTERESIS_PCT,
+                |p| format!("CPU busy down to {p}%"),
+            ),
+            HeatSource::Load => (
+                r.cpu_load.map(|_| self.work_avg.round() as i32),
+                p.hot_load_pct as i32 - LOAD_HYSTERESIS_PCT,
+                |p| format!("CPU work down to {p}%"),
             ),
         }
     }
@@ -441,28 +547,37 @@ impl Engine {
         if self.cooling {
             // only the source that started it may lift it: the board reads far lower
             // than the CPU, and a missing sensor is no proof of cooling down
-            let (t, hot, hysteresis, say) = self.heat_signal(self.cooling_by, inp);
+            let by = self.cooling_by;
+            let hot = self.heat_signal(by, inp).1;
             if hot <= 0 {
                 return self.lift("heat guard turned off".into());
             }
-            // the load guard is for a closed lid; with the lid open the fan can breathe
-            if self.cooling_by == HeatSource::Load && inp.lid_closed == Some(false) {
+            // the load guard is for a closed lid; with the user back the fan can breathe
+            if by == HeatSource::Load && !self.away(inp) {
                 return self.lift("lid opened".into());
             }
+            let (t, cool, say) = self.cool_signal(by, inp);
             match t {
-                Some(t) if t <= hot - hysteresis && inp.now - self.cooling_since >= COOL_FOR_SECS => self.lift(say(t)),
+                Some(t) if t <= cool && inp.now.saturating_sub(self.cooling_since) >= COOL_FOR_SECS => self.lift(say(t)),
                 _ => vec![],
             }
         } else {
-            let by = self.heat_source(&inp.readings);
-            let (t, hot, _, say) = self.heat_signal(by, inp);
-            let lid_ok = by != HeatSource::Load || self.away(inp);
-            let Some(t) = t.filter(|&t| hot > 0 && t >= hot && lid_ok) else {
+            let hot = self.heat_candidates(&inp.readings).into_iter().find_map(|by| {
+                let (t, hot, say) = self.heat_signal(by, inp);
+                let lid_ok = by != HeatSource::Load || self.away(inp);
+                t.filter(|&t| hot > 0 && t >= hot && lid_ok).map(|t| (by, t, say))
+            });
+            let Some((by, t, say)) = hot else {
                 self.hot_since = None;
                 return vec![];
             };
+            // the 30 s count belongs to one source
+            if self.hot_by != Some(by) {
+                self.hot_by = Some(by);
+                self.hot_since = None;
+            }
             let since = *self.hot_since.get_or_insert(inp.now);
-            if inp.now - since < HOT_FOR_SECS {
+            if inp.now.saturating_sub(since) < HOT_FOR_SECS {
                 return vec![];
             }
             self.cooling = true;
@@ -527,6 +642,7 @@ mod tests {
             warn_before_secs: 600,
             countdown_secs: 60,
             away_idle_secs: 300,
+            claude_quiet_secs: 600,
             reconnect: true,
             reconnect_after_secs: 90,
             hot_cpu_temp_c: 85,
@@ -542,6 +658,7 @@ mod tests {
             idle_secs: 0,
             battery: Some(Battery { percent: 80, on_ac: true, secs_left: None }),
             readings: Readings::default(),
+            claude_busy: 0,
         }
     }
 
@@ -746,6 +863,7 @@ mod tests {
         let mut i = inp(now, Some(lid_closed));
         i.readings.temp_c = Some(28);
         i.readings.cpu_busy = Some(busy);
+        i.readings.cpu_load = Some(busy);
         i
     }
 
@@ -779,6 +897,57 @@ mod tests {
         assert!(run_busy(&mut e, 905, 960, 100, true, true));
         // opening it lifts
         assert!(cools(&e.tick(&busy_at(965, 100, false)), false));
+    }
+
+    #[test]
+    fn load_cooldown_lifts_when_the_work_is_light_even_if_busy_time_is_not() {
+        // capped at 60%, a light job keeps the CPU busy longer: busy time stays
+        // high while the work done (busy x speed) is low
+        let mut e = Engine::new(params());
+        e.start(0, None);
+        assert!(run_busy(&mut e, 5, 600, 100, true, true));
+        let lifted = (605..=1500).step_by(5).any(|t| {
+            let mut i = busy_at(t, 58, true);
+            i.readings.cpu_load = Some(35);
+            cools(&e.tick(&i), false)
+        });
+        assert!(lifted);
+    }
+
+    #[test]
+    fn a_board_sensor_that_moves_a_little_does_not_switch_off_the_load_guard() {
+        let mut e = Engine::new(params());
+        e.start(0, None);
+        let cooled = (5..=900).step_by(5).any(|t| {
+            let mut i = busy_at(t, 100, true);
+            i.readings.temp_c = Some(if t < 100 { 28 } else { 31 });
+            cools(&e.tick(&i), true)
+        });
+        assert!(cooled);
+        assert_eq!(e.cooling_by, HeatSource::Load);
+    }
+
+    #[test]
+    fn load_cooldown_lifts_when_the_user_is_back_and_the_lid_state_is_unknown() {
+        let mut e = Engine::new(params());
+        e.start(0, None);
+        let at = |t, idle| {
+            let mut i = busy_at(t, 100, true);
+            i.lid_closed = None;
+            i.idle_secs = idle;
+            i
+        };
+        assert!((5..=900).step_by(5).any(|t| cools(&e.tick(&at(t, 600)), true)));
+        assert!(cools(&e.tick(&at(905, 2)), false));
+    }
+
+    #[test]
+    fn heat_guard_survives_the_clock_going_back() {
+        let mut e = Engine::new(params());
+        e.start(1000, None);
+        e.tick(&cpu_at(1005, 90));
+        // NTP moved the clock back: no instant cooling, no panic
+        assert!(!cools(&e.tick(&cpu_at(900, 90)), true));
     }
 
     #[test]
@@ -857,6 +1026,96 @@ mod tests {
         e.start(0, None);
         e.tick(&cpu_at(5, 99));
         assert!(!cools(&e.tick(&cpu_at(60, 99)), true));
+    }
+
+    fn claude(now: u64, busy: usize, lid_closed: bool) -> Inputs {
+        let mut i = inp(now, Some(lid_closed));
+        i.claude_busy = busy;
+        i
+    }
+
+    #[test]
+    fn while_claude_ends_after_quiet_time_and_sleeps_if_away() {
+        let mut e = Engine::new(params());
+        e.start_while_claude(0);
+        assert!(e.tick(&claude(5, 1, true)).is_empty() || e.is_on());
+        // busy for an hour: keeps going
+        for t in (10..3600).step_by(5) {
+            assert!(!restores(&e.tick(&claude(t, 2, true))));
+        }
+        // quiet, but not long enough; then busy again resets the clock
+        e.tick(&claude(3600, 0, true));
+        e.tick(&claude(4000, 0, true));
+        e.tick(&claude(4005, 1, true));
+        e.tick(&claude(4010, 0, true));
+        assert!(e.countdown.is_none());
+        // 10 quiet minutes: the usual lid-closed countdown
+        e.tick(&claude(4610, 0, true));
+        assert_eq!(e.countdown.as_ref().unwrap().reason, EndReason::ClaudeDone);
+        let acts = e.tick(&claude(4670, 0, true));
+        assert_eq!(acts, vec![Action::Restore(EndReason::ClaudeDone), Action::Suspend(AfterAction::Sleep)]);
+    }
+
+    #[test]
+    fn while_claude_with_the_lid_open_only_restores() {
+        let mut e = Engine::new(params());
+        e.start_while_claude(0);
+        e.tick(&claude(5, 0, false));
+        let acts = e.tick(&claude(605, 0, false));
+        assert!(acts.contains(&Action::Restore(EndReason::ClaudeDone)));
+        assert!(!acts.iter().any(|a| matches!(a, Action::Suspend(_))));
+    }
+
+    #[test]
+    fn keep_working_after_claude_is_done_waits_for_quiet_again() {
+        let mut e = Engine::new(params());
+        e.start_while_claude(0);
+        e.tick(&claude(5, 0, true));
+        e.tick(&claude(605, 0, true));
+        assert!(e.countdown.is_some());
+        e.cancel_countdown(610);
+        assert!(e.countdown.is_none() && e.is_on());
+        assert!(!restores(&e.tick(&claude(615, 0, true))));
+        e.tick(&claude(1214, 0, true));
+        assert!(e.countdown.is_none());
+        e.tick(&claude(1215, 0, true));
+        assert!(e.countdown.is_some());
+    }
+
+    #[test]
+    fn plus_an_hour_while_claude_is_done_waits_for_quiet_again() {
+        let mut e = Engine::new(params());
+        e.start_while_claude(0);
+        e.tick(&claude(5, 0, true));
+        e.tick(&claude(605, 0, true));
+        assert!(e.countdown.is_some());
+        e.extend(610, 3600);
+        assert!(e.countdown.is_none());
+        e.tick(&claude(615, 0, true));
+        assert!(e.countdown.is_none(), "must not count down again right away");
+    }
+
+    #[test]
+    fn claude_working_again_cancels_the_countdown() {
+        let mut e = Engine::new(params());
+        e.start_while_claude(0);
+        e.tick(&claude(5, 0, true));
+        e.tick(&claude(605, 0, true));
+        assert!(e.countdown.is_some());
+        let acts = e.tick(&claude(630, 1, true));
+        assert!(!restores(&acts));
+        assert!(e.countdown.is_none() && e.is_on());
+        assert!(!e.tick(&claude(700, 1, true)).iter().any(|a| matches!(a, Action::Suspend(_))));
+    }
+
+    #[test]
+    fn while_claude_still_has_the_battery_floor() {
+        let mut e = Engine::new(params());
+        e.start_while_claude(0);
+        let mut i = claude(10, 3, true);
+        i.battery = Some(Battery { percent: 12, on_ac: false, secs_left: None });
+        e.tick(&i);
+        assert_eq!(e.countdown.as_ref().unwrap().reason, EndReason::Battery);
     }
 
     #[test]

@@ -46,8 +46,9 @@ struct LhmReader {
 }
 
 const LHM_RETRY: Duration = Duration::from_secs(60);
-/// A reading older than this is no reading (LHM stopped answering).
-const LHM_FRESH: Duration = Duration::from_secs(20);
+/// A reading older than this is no reading (LHM stopped answering). Longer
+/// than LHM_RETRY, so one slow answer doesn't drop the temperature for a minute.
+const LHM_FRESH: Duration = Duration::from_secs(75);
 
 impl Sensors {
     pub fn new() -> Option<Self> {
