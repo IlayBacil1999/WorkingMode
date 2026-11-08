@@ -20,6 +20,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPU
 
 pub const SCHEME_BALANCED: GUID = GUID::from_u128(0x381b4222_f694_41f0_9685_ff5bb260df2e);
 pub const GUID_LIDSWITCH_STATE_CHANGE: GUID = GUID::from_u128(0xba3e0f4d_b817_4094_a2d1_d56379e6a0f3);
+/// Screen of the session's console: 0 off, 1 on, 2 dimmed. Sent once on registering, then on each change.
+pub const GUID_CONSOLE_DISPLAY_STATE: GUID = GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
 
 pub struct Setting {
     pub name: &'static str,
@@ -32,6 +34,7 @@ const fn setting(name: &'static str, sub: u128, id: u128) -> Setting {
 }
 
 const SUB_NONE: u128 = 0xfea3413e_7e05_4911_9a71_700331f1c294;
+const SUB_NONE_GUID: GUID = GUID::from_u128(SUB_NONE);
 const SUB_BUTTONS: u128 = 0x4f971e89_eebd_4455_a8de_9e59040e7347;
 const SUB_SLEEP: u128 = 0x238c9fa8_0aad_41ed_83f4_97be242c8f20;
 const SUB_VIDEO: u128 = 0x7516b95f_f776_4464_8c53_06167f40cc99;
@@ -121,22 +124,86 @@ pub fn ensure_plan(cfg: &mut Config) -> Result<GUID, String> {
     Ok(g)
 }
 
+/// The shorter of two timeouts, where 0 means never.
+pub fn shorter_timeout(a: u32, b: u32) -> u32 {
+    match (a, b) {
+        (0, x) | (x, 0) => x,
+        (a, b) => a.min(b),
+    }
+}
+
+/// Every (subgroup, setting) pair in a plan, hidden ones included.
+fn all_settings(scheme: &GUID) -> Vec<(GUID, GUID)> {
+    let next = |sub: *const GUID, flags: POWER_DATA_ACCESSOR, i: u32| -> Option<GUID> {
+        let mut g = GUID::from_u128(0);
+        let mut size = std::mem::size_of::<GUID>() as u32;
+        let rc = unsafe { PowerEnumerate(null_mut(), scheme, sub, flags, i, (&mut g as *mut GUID).cast(), &mut size) };
+        (rc == ERROR_SUCCESS).then_some(g)
+    };
+    // settings outside any subgroup aren't under an enumerated subgroup
+    let mut subs = vec![SUB_NONE_GUID];
+    for g in (0..).map_while(|i| next(null(), ACCESS_SUBGROUP, i)) {
+        if !subs.iter().any(|s| crate::win::guid_eq(s, &g)) {
+            subs.push(g);
+        }
+    }
+    let mut out = Vec::new();
+    for sub in subs {
+        out.extend((0..).map_while(|i| next(&sub, ACCESS_INDIVIDUAL_SETTING, i)).map(|id| (sub, id)));
+    }
+    out
+}
+
+/// Copies every value of `from` into `to`, except the ones Working Mode sets
+/// itself, so the session plan matches the user's own plan as it is today.
+/// Returns (copied, failed).
+fn copy_settings(from: &GUID, to: &GUID) -> (usize, usize) {
+    let ours = |sub: &GUID, id: &GUID| ALL.iter().any(|s| crate::win::guid_eq(&s.sub, sub) && crate::win::guid_eq(&s.id, id));
+    let (mut copied, mut failed) = (0, 0);
+    for (sub, id) in all_settings(from) {
+        if ours(&sub, &id) {
+            continue;
+        }
+        let s = Setting { name: "copied setting", sub, id };
+        match read(from, &s) {
+            Some(v) if read(to, &s) == Some(v) => copied += 1,
+            Some((ac, dc)) => match write(to, &s, ac, dc) {
+                Ok(()) => copied += 1,
+                Err(_) => failed += 1,
+            },
+            None => {}
+        }
+    }
+    (copied, failed)
+}
+
 /// Writes all Working Mode values into our plan. `previous` supplies the
 /// user's own values for anything the config says to leave alone.
 /// Returns the settings that could not be written (missing on this PC is fine).
-pub fn apply_plan(plan: &GUID, cfg: &Config, previous: &GUID) -> Vec<String> {
+/// `hold_cpu`: apply the CPU cap and boost setting (lid closed, or cooling);
+/// otherwise the user's own processor values are kept.
+/// `lid_closed`: use the short lid-closed screen timer.
+pub fn apply_plan(plan: &GUID, cfg: &Config, previous: &GUID, hold_cpu: bool, lid_closed: bool) -> Vec<String> {
+    let (copied, failed) = copy_settings(previous, plan);
+    log(&format!(
+        "plan: {copied} settings match your own plan{}",
+        if failed > 0 { format!(", {failed} couldn't be copied") } else { String::new() }
+    ));
     let keep = |s: &Setting, fallback: (u32, u32)| read(previous, s).unwrap_or(fallback);
-    let cpu = cfg.cpu_max.clamp(5, 100);
-    let turbo = if cfg.turbo_off { (0, 0) } else { keep(&TURBO, (2, 2)) };
+    let cpu = if hold_cpu { (cfg.cpu_max.clamp(5, 100), cfg.cpu_max.clamp(5, 100)) } else { keep(&CPU_MAX, (100, 100)) };
+    let turbo = if hold_cpu && cfg.turbo_off { (0, 0) } else { keep(&TURBO, (2, 2)) };
     let unattended = if cfg.unattended_zero { (0, 0) } else { keep(&UNATTENDED_SLEEP, (120, 120)) };
+    let (screen_ac, screen_dc) = keep(&SCREEN_OFF, (0, 0));
+    let limit = if lid_closed && cfg.lid_closed_screen_off_secs > 0 { cfg.lid_closed_screen_off_secs } else { cfg.screen_off_secs };
+    let screen = (shorter_timeout(screen_ac, limit), shorter_timeout(screen_dc, limit));
     let values: [(&Setting, (u32, u32)); 9] = [
         (&LID_ACTION, (0, 0)),
         (&SLEEP_AFTER, (0, 0)),
         (&HIBERNATE_AFTER, (0, 0)),
         (&UNATTENDED_SLEEP, unattended),
         (&NET_IN_STANDBY, (1, 1)),
-        (&SCREEN_OFF, (cfg.screen_off_secs, cfg.screen_off_secs)),
-        (&CPU_MAX, (cpu, cpu)),
+        (&SCREEN_OFF, screen),
+        (&CPU_MAX, cpu),
         (&TURBO, turbo),
         (&WIFI_SAVING, (0, 0)),
     ];
@@ -207,7 +274,23 @@ pub fn battery() -> Option<Battery> {
         return None;
     }
     let secs_left = (s.BatteryLifeTime != u32::MAX).then_some(s.BatteryLifeTime as u64);
-    Some(Battery { percent: s.BatteryLifePercent, on_ac: s.ACLineStatus == 1, secs_left })
+    Some(Battery { percent: s.BatteryLifePercent, on_ac: s.ACLineStatus == 1, secs_left, rate_mw: battery_rate_mw() })
+}
+
+/// Battery charge (+) / discharge (-) rate in mW; `None` if the battery doesn't say.
+fn battery_rate_mw() -> Option<i32> {
+    let mut st: SYSTEM_BATTERY_STATE = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        CallNtPowerInformation(
+            SystemBatteryState,
+            null(),
+            0,
+            (&mut st as *mut SYSTEM_BATTERY_STATE).cast(),
+            std::mem::size_of::<SYSTEM_BATTERY_STATE>() as u32,
+        )
+    };
+    let rate = st.Rate as i32;
+    (rc == 0 && st.BatteryPresent != 0 && rate != i32::MIN).then_some(rate)
 }
 
 pub fn idle_secs() -> u64 {
@@ -250,5 +333,34 @@ pub fn suspend(hibernate: bool) {
     log(&format!("SetSuspendState({}) refused - falling back to shutdown /h", if hibernate { "hibernate" } else { "sleep" }));
     if !crate::app::run_hidden("shutdown.exe", &["/h"]).unwrap_or(false) {
         log("shutdown /h failed too (is hibernation off?) - the PC stays on");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Touches the real Working Mode plan: run by hand with `--ignored`.
+    #[test]
+    #[ignore]
+    fn copies_the_whole_plan_on_this_pc() {
+        let cfg = Config::load();
+        let plan = cfg.plan_guid.as_deref().and_then(guid_from_str).expect("no Working Mode plan yet");
+        assert!(!crate::win::guid_eq(&active_scheme().unwrap(), &plan), "only while Working Mode is off");
+        let all = all_settings(&SCHEME_BALANCED);
+        let ours = all.iter().filter(|(sub, id)| ALL.iter().any(|s| crate::win::guid_eq(&s.sub, sub) && crate::win::guid_eq(&s.id, id))).count();
+        let (copied, failed) = copy_settings(&SCHEME_BALANCED, &plan);
+        println!("settings {}, ours {ours}, copied {copied}, failed {failed}", all.len());
+        assert_eq!(failed, 0);
+        assert_eq!(copied + ours, all.len());
+    }
+
+    #[test]
+    fn shorter_timeout_treats_zero_as_never() {
+        assert_eq!(shorter_timeout(300, 600), 300);
+        assert_eq!(shorter_timeout(900, 600), 600);
+        assert_eq!(shorter_timeout(0, 600), 600);
+        assert_eq!(shorter_timeout(300, 0), 300);
+        assert_eq!(shorter_timeout(0, 0), 0);
     }
 }

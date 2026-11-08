@@ -49,6 +49,8 @@ pub struct Battery {
     pub on_ac: bool,
     /// Windows' estimate; `None` while plugged in or still estimating.
     pub secs_left: Option<u64>,
+    /// Charge (+) or discharge (-) rate in milliwatts, when the battery reports it.
+    pub rate_mw: Option<i32>,
 }
 
 /// Sensor readings for the log and the heat guard. Any of them can be missing.
@@ -71,6 +73,8 @@ pub struct Inputs {
     pub now: u64,
     /// `None` until the first lid-switch notification arrives.
     pub lid_closed: Option<bool>,
+    /// Screen state (`GUID_CONSOLE_DISPLAY_STATE`): 0 off, 1 on, 2 dimmed; `None` until it arrives.
+    pub display: Option<u32>,
     pub idle_secs: u64,
     pub battery: Option<Battery>,
     pub readings: Readings,
@@ -169,6 +173,16 @@ fn notify(title: &str, body: impl Into<String>) -> Action {
 
 fn warn(title: &str, body: impl Into<String>) -> Action {
     Action::Notify { title: title.into(), body: body.into(), warning: true }
+}
+
+/// `GUID_CONSOLE_DISPLAY_STATE` value as a word for the log.
+pub fn display_name(state: Option<u32>) -> &'static str {
+    match state {
+        Some(0) => "off",
+        Some(1) => "on",
+        Some(2) => "dimmed",
+        Some(_) | None => "?",
+    }
 }
 
 pub fn fmt_span(secs: u64) -> String {
@@ -386,6 +400,8 @@ impl Engine {
                 Some(false) => "open",
                 None => "?",
             };
+            let display = display_name(inp.display);
+            let watts = inp.battery.and_then(|b| b.rate_mw).map_or(String::new(), |mw| format!("  power={:+.1}W", mw as f64 / 1000.0));
             let online = match self.online {
                 Some(true) => "yes",
                 Some(false) => "NO",
@@ -394,7 +410,7 @@ impl Engine {
             let r = inp.readings;
             let opt = |v: Option<u32>| v.map_or("?".into(), |v| v.to_string());
             acts.push(Action::Log(format!(
-                "alive  online={online}  battery={bat}  lid={lid}  idle={}s  cputemp={}C  board={}C  cpu={}%  busy={}% (avg {:.0}%)  speed={}%{}",
+                "alive  online={online}  battery={bat}{watts}  lid={lid}  display={display}  idle={}s  cputemp={}C  board={}C  cpu={}%  busy={}% (avg {:.0}%)  speed={}%{}",
                 inp.idle_secs,
                 r.cpu_temp_c.map_or("?".into(), |t| t.to_string()),
                 r.temp_c.map_or("?".into(), |t| t.to_string()),
@@ -655,8 +671,9 @@ mod tests {
         Inputs {
             now,
             lid_closed,
+            display: Some(1),
             idle_secs: 0,
-            battery: Some(Battery { percent: 80, on_ac: true, secs_left: None }),
+            battery: Some(Battery { percent: 80, on_ac: true, secs_left: None, rate_mw: None }),
             readings: Readings::default(),
             claude_busy: 0,
         }
@@ -728,7 +745,7 @@ mod tests {
         let mut e = Engine::new(params());
         e.start(0, None);
         let mut i = inp(10, Some(true));
-        i.battery = Some(Battery { percent: 14, on_ac: false, secs_left: None });
+        i.battery = Some(Battery { percent: 14, on_ac: false, secs_left: None, rate_mw: None });
         e.tick(&i);
         assert_eq!(e.countdown.as_ref().unwrap().after, AfterAction::Hibernate);
     }
@@ -738,7 +755,7 @@ mod tests {
         let mut e = Engine::new(params());
         e.start(0, None);
         let mut i = inp(10, Some(false));
-        i.battery = Some(Battery { percent: 10, on_ac: false, secs_left: None });
+        i.battery = Some(Battery { percent: 10, on_ac: false, secs_left: None, rate_mw: None });
         assert_eq!(e.tick(&i), vec![Action::Restore(EndReason::Battery)]);
     }
 
@@ -1012,7 +1029,7 @@ mod tests {
         let mut e = Engine::new(params());
         e.start(0, Some(7200));
         let mut i = inp(10, Some(true));
-        i.battery = Some(Battery { percent: 14, on_ac: false, secs_left: None });
+        i.battery = Some(Battery { percent: 14, on_ac: false, secs_left: None, rate_mw: None });
         e.tick(&i);
         assert!(e.countdown.is_some());
         let acts = e.extend(20, 3600);
@@ -1026,6 +1043,18 @@ mod tests {
         e.start(0, None);
         e.tick(&cpu_at(5, 99));
         assert!(!cools(&e.tick(&cpu_at(60, 99)), true));
+    }
+
+    #[test]
+    fn heartbeat_shows_the_screen_state() {
+        let mut e = Engine::new(params());
+        e.start(0, Some(3600));
+        let mut i = inp(HEARTBEAT_SECS, Some(true));
+        i.display = Some(0);
+        let acts = e.tick(&i);
+        assert!(acts.iter().any(|a| matches!(a, Action::Log(l) if l.contains("lid=closed  display=off"))), "{acts:?}");
+        assert_eq!(display_name(Some(2)), "dimmed");
+        assert_eq!(display_name(None), "?");
     }
 
     fn claude(now: u64, busy: usize, lid_closed: bool) -> Inputs {
@@ -1113,7 +1142,7 @@ mod tests {
         let mut e = Engine::new(params());
         e.start_while_claude(0);
         let mut i = claude(10, 3, true);
-        i.battery = Some(Battery { percent: 12, on_ac: false, secs_left: None });
+        i.battery = Some(Battery { percent: 12, on_ac: false, secs_left: None, rate_mw: None });
         e.tick(&i);
         assert_eq!(e.countdown.as_ref().unwrap().reason, EndReason::Battery);
     }

@@ -4,7 +4,7 @@
 use crate::claude;
 use crate::config::{self, autostart_enabled, clock_in, log, now, set_autostart, Config, SavedState};
 use crate::engine::{fmt_span, Action, AfterAction, EndReason, Engine, HeatSource, Inputs, Readings};
-use crate::power::{self, PowerRequest, GUID_LIDSWITCH_STATE_CHANGE, SCHEME_BALANCED};
+use crate::power::{self, PowerRequest, GUID_CONSOLE_DISPLAY_STATE, GUID_LIDSWITCH_STATE_CHANGE, SCHEME_BALANCED};
 use crate::sensors::Sensors;
 use crate::win::{fill, guid_eq, guid_from_str, guid_to_string, opt_guid_eq, wide};
 use crate::wifi;
@@ -80,6 +80,8 @@ struct App {
     previous: Option<GUID>,
     request: Option<PowerRequest>,
     lid_closed: Option<bool>,
+    /// Screen: 0 off, 1 on, 2 dimmed; `None` until Windows says.
+    display: Option<u32>,
     wifi: Option<wifi::Connection>,
     /// Critical settings that didn't apply: not safe to close the lid.
     problems: Vec<String>,
@@ -264,6 +266,7 @@ impl App {
         Inputs {
             now: now(),
             lid_closed: self.lid_closed,
+            display: self.display,
             idle_secs: power::idle_secs(),
             battery: power::battery(),
             readings: self.sensors.as_ref().map(|s| s.read(&self.cfg.lhm())).unwrap_or_default(),
@@ -308,7 +311,10 @@ impl App {
         } else {
             self.cfg.clone()
         };
-        let unwritten = power::apply_plan(&plan, &cfg, &prev);
+        // the CPU limits are for heat in the bag: with the lid open the user is
+        // there and the PC runs as usual, unless the heat guard is cooling it
+        let hold_cpu = self.engine.cooling || self.lid_closed != Some(false);
+        let unwritten = power::apply_plan(&plan, &cfg, &prev, hold_cpu, self.lid_closed == Some(true));
         if !unwritten.is_empty() {
             log(&format!("could not write: {}", unwritten.join(", ")));
         }
@@ -443,8 +449,11 @@ impl App {
                     if let Err(e) = self.apply() {
                         log(&format!("couldn't change the CPU limit: {e}"));
                     } else {
-                        let pct = if on { self.cfg.cpu_max.min(self.cfg.hot_cpu_max) } else { self.cfg.cpu_max };
-                        log(&format!("CPU limit now {pct}%"));
+                        match (on, self.lid_closed) {
+                            (true, _) => log(&format!("CPU limit now {}%", self.cfg.cpu_max.min(self.cfg.hot_cpu_max))),
+                            (false, Some(false)) => log("CPU back to normal (lid open)"),
+                            (false, _) => log(&format!("CPU limit now {}%", self.cfg.cpu_max)),
+                        }
                     }
                 }
             }
@@ -722,8 +731,8 @@ impl App {
             for (v, label) in CPU_CHOICES {
                 item(cpu, check(self.cfg.cpu_max == v), ID_CPU + v as usize, label);
             }
-            item(settings, MF_POPUP, cpu as usize, "CPU limit while working");
-            item(settings, check(self.cfg.turbo_off), ID_TURBO, "Turbo boost off (much cooler)");
+            item(settings, MF_POPUP, cpu as usize, "CPU limit with the lid closed");
+            item(settings, check(self.cfg.turbo_off), ID_TURBO, "Turbo boost off with the lid closed (much cooler)");
             let end = CreatePopupMenu();
             for (i, (v, label)) in END_CHOICES.iter().enumerate() {
                 item(end, check(self.cfg.end_with_lid_closed == *v), ID_END + i, label);
@@ -929,8 +938,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if a.lid_closed.is_some() || a.engine.is_on() {
                                 log(if open { "lid opened" } else { "lid closed" });
                             }
+                            let changed = a.lid_closed != Some(!open);
                             a.lid_closed = Some(!open);
                             a.tick();
+                            // CPU limits only while the lid is closed (see apply)
+                            if changed && a.engine.is_on() {
+                                let cpu = if !open || a.engine.cooling { "CPU limits on" } else { "CPU back to normal" };
+                                let screen = match (open, a.cfg.lid_closed_screen_off_secs) {
+                                    (true, _) | (false, 0) => "usual screen timer".to_string(),
+                                    (false, n) => format!("screen off after {n} s idle"),
+                                };
+                                log(&format!("lid {} - {cpu}, {screen}", if open { "open" } else { "closed" }));
+                                a.reapply_if_on();
+                            }
+                        });
+                    } else if guid_eq(&s.PowerSetting, &GUID_CONSOLE_DISPLAY_STATE) && s.DataLength >= 4 {
+                        let state = std::ptr::read_unaligned(s.Data.as_ptr().cast::<u32>());
+                        with_app(|a| {
+                            // the first value only says how things are; log changes, and only in a session
+                            if a.display.is_some() && a.display != Some(state) && a.engine.is_on() {
+                                let lid = match a.lid_closed {
+                                    Some(true) => " (lid closed)",
+                                    Some(false) => " (lid open)",
+                                    None => "",
+                                };
+                                log(&format!("screen {}{lid}", crate::engine::display_name(Some(state))));
+                            }
+                            a.display = Some(state);
                         });
                     }
                 }
@@ -1013,6 +1047,7 @@ pub fn run() {
             previous: None,
             request: None,
             lid_closed: None,
+            display: None,
             wifi: None,
             problems: vec![],
             icons,
@@ -1032,6 +1067,7 @@ pub fn run() {
 
         // the current lid state arrives right after registering
         RegisterPowerSettingNotification(hwnd, &GUID_LIDSWITCH_STATE_CHANGE, DEVICE_NOTIFY_WINDOW_HANDLE);
+        RegisterPowerSettingNotification(hwnd, &GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_WINDOW_HANDLE);
         with_app(|a| a.recover());
         SetTimer(hwnd, TIMER_ID, TICK_MS, None);
 

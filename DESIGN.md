@@ -30,7 +30,7 @@ While on, the PC behaves exactly as usual, apart from our limits (CPU cap, turbo
 
 ## 3. What "ON" changes
 
-A dedicated plan named "Working Mode" is copied from Balanced once and reused. The user's own plan is never edited.
+A dedicated plan named "Working Mode" is created once and reused. At every apply, every setting of the user's own plan (the one active before the session, hidden ones included) is copied into it, then only the rows below are changed. So brightness and everything else match normal use. The user's own plan is never edited.
 
 | Setting | AC/DC value | Why |
 |---|---|---|
@@ -39,9 +39,9 @@ A dedicated plan named "Working Mode" is copied from Balanced once and reused. T
 | System unattended sleep timeout (hidden) | 0 | was 120 s on this machine |
 | Networking connectivity in standby | Enable | fallback if standby happens anyway |
 | Wi-Fi power saving | Maximum performance | was "medium saving" on battery |
-| Max processor state | 90% (configurable) | heat |
-| Processor boost mode | Disabled (configurable) | heat, biggest single lever |
-| Turn off display after | 10 min | screen off when lid open + idle |
+| Max processor state | 90% (configurable), **lid closed only**; lid open keeps the user's value unless the heat guard is cooling | heat |
+| Processor boost mode | Disabled (configurable), **lid closed only** | heat, biggest single lever |
+| Turn off display after | lid open: the user's value, at most 10 min; lid closed: 15 s (`lid_closed_screen_off_secs`, 0 = off) | this laptop's lid doesn't turn the panel off; an app that asks for the display (a game window, video) still keeps it on |
 
 Plus a **power request** (SystemRequired + ExecutionRequired) held for the session.
 
@@ -56,7 +56,8 @@ After applying, the app **reads every critical value back**. If any failed, the 
 | Heartbeat | log line: online, battery, lid, idle | 60 s |
 | Sleep detector | gap > 60 s between 5 s ticks ⇒ log `GAP` (the PC was suspended) | 5 s |
 | Ending soon | notification 10 min before the end | |
-| Lid | `GUID_LIDSWITCH_STATE_CHANGE` notifications, logged | event |
+| Lid | `GUID_LIDSWITCH_STATE_CHANGE` notifications, logged; a change re-applies the plan (CPU limits on/off) | event |
+| Screen | `GUID_CONSOLE_DISPLAY_STATE`: `screen off/on/dimmed (lid …)` lines and `display=` in `alive` | event |
 
 ## 5. Safety
 

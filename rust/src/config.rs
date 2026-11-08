@@ -31,6 +31,9 @@ pub struct Config {
     pub cpu_max: u32,
     pub turbo_off: bool,
     pub screen_off_secs: u32,
+    /// Screen-off timer while the lid is closed (the lid doesn't turn the panel
+    /// off on every laptop); 0 = same as `screen_off_secs`.
+    pub lid_closed_screen_off_secs: u32,
     pub unattended_zero: bool,
     pub hold_power_request: bool,
     pub end_with_lid_closed: AfterAction,
@@ -69,6 +72,7 @@ impl Default for Config {
             cpu_max: 90,
             turbo_off: true,
             screen_off_secs: 600,
+            lid_closed_screen_off_secs: 15,
             unattended_zero: true,
             hold_power_request: true,
             end_with_lid_closed: AfterAction::Sleep,
